@@ -4,7 +4,9 @@ import path from 'node:path';
 import { jest } from '@jest/globals';
 import {
   getUserPersistencePaths,
+  loadPersistedBrowserProfile,
   loadPersistedStorageState,
+  persistBrowserProfile,
   persistStorageState,
 } from '../../lib/persistence.js';
 
@@ -35,6 +37,38 @@ describe('profile persistence helpers', () => {
 
   test('loadPersistedStorageState returns undefined when no state exists', async () => {
     await expect(loadPersistedStorageState(tmpDir, 'user-1')).resolves.toBeUndefined();
+  });
+
+  test('persistBrowserProfile writes and reloads a stable browser profile payload', async () => {
+    const profile = {
+      persona: {
+        os: 'windows',
+        locale: 'fr-FR',
+        timezoneId: 'Europe/Paris',
+      },
+      launchConstraints: {
+        screen: { minWidth: 1536, maxWidth: 1536, minHeight: 864, maxHeight: 864 },
+        window: { outerWidth: 1536, outerHeight: 864 },
+      },
+    };
+
+    const result = await persistBrowserProfile({
+      profileDir: tmpDir,
+      userId: 'user-browser-1',
+      profile,
+      logger: { warn: jest.fn() },
+    });
+
+    expect(result.persisted).toBe(true);
+    await expect(loadPersistedBrowserProfile(tmpDir, 'user-browser-1')).resolves.toEqual(profile);
+  });
+
+  test('loadPersistedBrowserProfile ignores invalid JSON files', async () => {
+    const { browserProfilePath } = getUserPersistencePaths(tmpDir, 'user-browser-2');
+    await fs.mkdir(path.dirname(browserProfilePath), { recursive: true });
+    await fs.writeFile(browserProfilePath, '{not-json');
+
+    await expect(loadPersistedBrowserProfile(tmpDir, 'user-browser-2', { warn: jest.fn() })).resolves.toBeUndefined();
   });
 
   test('persistStorageState writes storage state and metadata, then load returns the storage path', async () => {

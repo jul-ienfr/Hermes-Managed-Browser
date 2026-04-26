@@ -21,6 +21,8 @@
  * Storage state is checkpointed on cookie import, session close, and shutdown.
  * On session creation, saved state is restored into the new Playwright context
  * via the session:creating hook (mutates contextOptions.storageState).
+ * Session-close checkpointing happens on session:destroying, before the
+ * BrowserContext is actually closed.
  */
 
 import {
@@ -100,14 +102,20 @@ export async function register(app, ctx, pluginConfig = {}) {
     }
   });
 
-  // On session destroy: checkpoint then remove from tracking
-  events.on('session:destroyed', async ({ userId, reason }) => {
-    const context = activeSessions.get(userId);
-    if (context) {
-      // Context may already be closed — checkpoint will fail gracefully
-      await checkpoint(userId, context, reason).catch(() => {});
-      activeSessions.delete(userId);
+  // Before session destroy: checkpoint while the context is still alive,
+  // then remove it from tracking so post-close hooks do not retry.
+  events.on('session:destroying', async ({ userId, reason, context }) => {
+    const trackedContext = activeSessions.get(userId) || context;
+    if (trackedContext) {
+      await checkpoint(userId, trackedContext, reason).catch(() => {});
     }
+    activeSessions.delete(userId);
+  });
+
+  // After session destroy: ensure tracking is cleared even if a session was
+  // destroyed without the pre-close hook for some reason.
+  events.on('session:destroyed', async ({ userId }) => {
+    activeSessions.delete(userId);
   });
 
   // On shutdown: checkpoint all remaining sessions

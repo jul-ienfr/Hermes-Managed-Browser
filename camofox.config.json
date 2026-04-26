@@ -5,6 +5,12 @@
   "plugins": {
     "youtube": { "enabled": true },
     "persistence": { "enabled": true },
-    "vnc": { "resolution": "1920x1080" }
+    "vnc": {
+      "enabled": true,
+      "resolution": "1920x1080",
+      "vncPort": 5901,
+      "novncPort": 6081,
+      "viewOnly": false
+    }
   }
 }

@@ -68,7 +68,7 @@ describe('persistence plugin', () => {
     expect(saved.cookies[0].name).toBe('x');
   });
 
-  test('checkpoints on session:destroyed', async () => {
+  test('checkpoints on session:destroying before context close', async () => {
     await register(mockApp, ctx, { profileDir: tmpDir });
 
     const mockContext = {
@@ -78,9 +78,10 @@ describe('persistence plugin', () => {
     };
 
     await events.emitAsync('session:created', { userId: 'user-3', context: mockContext });
+    await events.emitAsync('session:destroying', { userId: 'user-3', reason: 'test', context: mockContext });
     await events.emitAsync('session:destroyed', { userId: 'user-3', reason: 'test' });
 
-    expect(mockContext.storageState).toHaveBeenCalled();
+    expect(mockContext.storageState).toHaveBeenCalledTimes(1);
   });
 
   test('env var CAMOFOX_PROFILE_DIR overrides pluginConfig', async () => {

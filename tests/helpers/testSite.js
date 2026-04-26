@@ -71,6 +71,32 @@ function createTestApp() {
       </body></html>
     `);
   });
+
+  // Page with duplicate accessible names to verify ref-specific selector fallback
+  app.get('/duplicate-searchboxes', (req, res) => {
+    res.send(`
+      <!DOCTYPE html>
+      <html><head><title>Duplicate Searchboxes</title></head>
+      <body>
+        <h1>Duplicate Searchboxes</h1>
+        <form>
+          <label>
+            Hidden Search
+            <input type="hidden" name="q" value="shadow-token" aria-label="Search" />
+          </label>
+          <label for="visibleSearch">Visible Search</label>
+          <textarea id="visibleSearch" name="q" aria-label="Search">hermes</textarea>
+          <div id="preview">Preview: hermes</div>
+        </form>
+        <script>
+          const field = document.getElementById('visibleSearch');
+          field.addEventListener('input', (e) => {
+            document.getElementById('preview').textContent = 'Preview: ' + e.target.value;
+          });
+        </script>
+      </body></html>
+    `);
+  });
   
   // Page for Enter key test - redirects on Enter
   app.get('/enter', (req, res) => {

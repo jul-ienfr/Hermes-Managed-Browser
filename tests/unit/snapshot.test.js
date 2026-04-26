@@ -1,4 +1,48 @@
-import { windowSnapshot, MAX_SNAPSHOT_CHARS, SNAPSHOT_TAIL_CHARS } from '../../lib/snapshot.js';
+import { filterSnapshotDialogArtifacts, windowSnapshot, MAX_SNAPSHOT_CHARS, SNAPSHOT_TAIL_CHARS } from '../../lib/snapshot.js';
+
+describe('filterSnapshotDialogArtifacts', () => {
+  test('removes unconfirmed dialog blocks when cookie signals are present', () => {
+    const yaml = [
+      '- banner:',
+      '  - text "Cookies"',
+      '  - button "Accepter" [e1]',
+      '- dialog "Recherche":',
+      '  - textbox "Votre métier, compétence ou mot-clé" [e2]',
+      '- dialog "Se connecter":',
+      '  - link "Connexion candidat" [e3]',
+      '- main:',
+      '  - heading "Bienvenue" [level=1]',
+    ].join('\n');
+
+    const filtered = filterSnapshotDialogArtifacts(yaml);
+    expect(filtered).toContain('text "Cookies"');
+    expect(filtered).toContain('heading "Bienvenue"');
+    expect(filtered).not.toContain('dialog "Recherche"');
+    expect(filtered).not.toContain('dialog "Se connecter"');
+  });
+
+  test('keeps dialog blocks when there is no cookie/consent signal', () => {
+    const yaml = [
+      '- dialog "Recherche":',
+      '  - textbox "Votre métier, compétence ou mot-clé" [e2]',
+      '- main:',
+      '  - heading "Bienvenue" [level=1]',
+    ].join('\n');
+
+    expect(filterSnapshotDialogArtifacts(yaml)).toContain('dialog "Recherche"');
+  });
+
+  test('keeps explicitly confirmed dialog names', () => {
+    const yaml = [
+      '- text "Cookies"',
+      '- dialog "Se connecter":',
+      '  - button "Continuer" [e1]',
+    ].join('\n');
+
+    const filtered = filterSnapshotDialogArtifacts(yaml, { confirmedDialogNames: ['Se connecter'] });
+    expect(filtered).toContain('dialog "Se connecter"');
+  });
+});
 
 describe('windowSnapshot', () => {
   const CONTENT_BUDGET = MAX_SNAPSHOT_CHARS - SNAPSHOT_TAIL_CHARS - 200;

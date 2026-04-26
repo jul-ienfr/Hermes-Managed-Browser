@@ -90,4 +90,32 @@ describe('Live Google Search', () => {
       await client.cleanup();
     }
   }, 120000);
+
+  (SKIP_LIVE_TESTS ? test.skip : test)('type into Google searchbox via snapshot ref on SERP', async () => {
+    const client = createClient(serverUrl);
+
+    try {
+      const { tabId } = await client.createTab();
+
+      await client.navigate(tabId, '@google_search hermes');
+      const snapshot = await client.getSnapshot(tabId);
+      const searchboxMatch = snapshot.snapshot.match(/searchbox\s+"[^"]*"\s+\[(e\d+)\]/i);
+
+      if (!searchboxMatch) {
+        console.log('No Google searchbox ref found in snapshot, skipping typing assertion');
+        return;
+      }
+      const ref = searchboxMatch[1];
+
+      const typeResult = await client.type(tabId, {
+        ref,
+        text: 'playwright docs',
+        mode: 'keyboard',
+      });
+
+      expect(typeResult.ok).toBe(true);
+    } finally {
+      await client.cleanup();
+    }
+  }, 120000);
 });

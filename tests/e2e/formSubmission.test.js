@@ -126,4 +126,34 @@ describe('Form Submission', () => {
       await client.cleanup();
     }
   });
+
+  test('type using ref targets visible searchbox instead of hidden duplicate', async () => {
+    const client = createClient(serverUrl);
+
+    try {
+      const { tabId } = await client.createTab(`${testSiteUrl}/duplicate-searchboxes`);
+      const snapshot = await client.getSnapshot(tabId);
+      const match = snapshot.snapshot.match(/(?:searchbox|textbox)\s+"Search"\s+\[(e\d+)\]/i);
+
+      expect(match).toBeTruthy();
+      const ref = match[1];
+
+      await client.type(tabId, {
+        ref,
+        text: 'playwright docs',
+      });
+
+      const evalResult = await client.evaluate(tabId, `(() => ({
+        preview: document.getElementById('preview')?.textContent || '',
+        hidden: document.querySelector('input[name="q"][type="hidden"]')?.value || '',
+        visible: document.getElementById('visibleSearch')?.value || ''
+      }))()`);
+
+      expect(evalResult.result.preview).toBe('Preview: playwright docs');
+      expect(evalResult.result.visible).toBe('playwright docs');
+      expect(evalResult.result.hidden).toBe('shadow-token');
+    } finally {
+      await client.cleanup();
+    }
+  });
 });

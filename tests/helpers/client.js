@@ -157,6 +157,10 @@ class BrowserClient {
   async getStats(tabId) {
     return this.request('GET', `/tabs/${tabId}/stats?userId=${this.userId}`);
   }
+
+  async evaluate(tabId, expression) {
+    return this.request('POST', `/tabs/${tabId}/evaluate`, { userId: this.userId, expression });
+  }
   
   async screenshot(tabId, fullPage = false) {
     return this.request('GET', `/tabs/${tabId}/screenshot?userId=${this.userId}&fullPage=${fullPage}`);

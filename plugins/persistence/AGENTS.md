@@ -6,7 +6,7 @@ Saves and restores per-user browser storage state (cookies + localStorage) acros
 
 - `session:creating` hook → loads saved `storage_state.json` into `contextOptions.storageState`
 - `session:created` hook → imports bootstrap cookies if no persisted state exists
-- `session:cookies:import` / `session:destroyed` / `server:shutdown` → checkpoints state to disk
+- `session:cookies:import` / `session:destroying` / `server:shutdown` → checkpoints state to disk
 
 All hooks are async and awaited via `emitAsync()` — storage state is guaranteed loaded before the context is created.
 

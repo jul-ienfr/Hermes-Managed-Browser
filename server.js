@@ -4,6 +4,8 @@ import { firefox } from 'playwright-core';
 import express from 'express';
 import crypto from 'crypto';
 import os from 'os';
+import path from 'node:path';
+import { resolveVncConfig } from './plugins/vnc/vnc-launcher.js';
 import { expandMacro } from './lib/macros.js';
 import { loadConfig } from './lib/config.js';
 import { normalizePlaywrightProxy, createProxyPool, buildProxyUrl } from './lib/proxy.js';
@@ -19,6 +21,11 @@ import {
   getDownloadsList,
 } from './lib/downloads.js';
 import { extractPageImages } from './lib/images.js';
+import {
+  recordFlow as recordAgentHistoryFlow,
+  recordSuccessfulBrowserAction,
+  replayAgentHistory,
+} from './lib/agent-history-memory.js';
 
 import {
   initMetrics, getRegister, isMetricsEnabled, createMetric,
@@ -27,8 +34,36 @@ import {
 import { actionFromReq, classifyError } from './lib/request-utils.js';
 import { cleanupOrphanedTempFiles } from './lib/tmp-cleanup.js';
 import { coalesceInflight } from './lib/inflight.js';
+import {
+  loadPersistedBrowserProfile,
+  persistBrowserProfile,
+} from './lib/persistence.js';
+import { buildBrowserPersona } from './lib/browser-persona.js';
 
 const CONFIG = loadConfig();
+const VNC_HEALTH_INFO = resolveVncConfig(CONFIG.plugins?.vnc || {});
+
+function getVncHealthFields(req) {
+  if (!VNC_HEALTH_INFO.enabled) return {};
+  const host = req.hostname || '127.0.0.1';
+  const protocol = req.protocol || 'http';
+  const novncPort = Number.parseInt(String(VNC_HEALTH_INFO.novncPort), 10);
+  const vncPort = Number.parseInt(String(VNC_HEALTH_INFO.vncPort), 10);
+  const fields = {
+    vncEnabled: true,
+    vncPort: Number.isFinite(vncPort) ? vncPort : null,
+    novncPort: Number.isFinite(novncPort) ? novncPort : null,
+    vncViewOnly: Boolean(VNC_HEALTH_INFO.viewOnly),
+  };
+  if (Number.isFinite(novncPort)) {
+    fields.novncUrl = `${protocol}://${host}:${novncPort}/vnc.html`;
+    fields.manualResolutionUrl = fields.novncUrl;
+  }
+  if (Number.isFinite(vncPort)) {
+    fields.vncUrl = `${protocol}://${host}:${vncPort}`;
+  }
+  return fields;
+}
 
 // --- Plugin event bus ---
 const pluginEvents = createPluginEvents();
@@ -247,11 +282,15 @@ app.post('/sessions/:userId/cookies', express.json({ limit: '512kb' }), async (r
   }
 });
 
-let browser = null;
+const browsers = new Map();
 // userId -> { context, tabGroups: Map<sessionKey, Map<tabId, TabState>>, lastAccess }
 // TabState = { page, refs: Map<refId, {role, name, nth}>, visitedUrls: Set, downloads: Array, toolCalls: number }
 // Note: sessionKey was previously called listItemId - both are accepted for backward compatibility
 const sessions = new Map();
+const BROWSER_PROFILE_DIR = process.env.CAMOFOX_PROFILE_DIR || path.join(os.homedir(), '.camofox', 'profiles');
+const KEEPALIVE_USER_ID = process.env.CAMOFOX_KEEPALIVE_USER_ID || '';
+const KEEPALIVE_SESSION_KEY = process.env.CAMOFOX_KEEPALIVE_SESSION_KEY || 'manual-login';
+const KEEPALIVE_URL = process.env.CAMOFOX_KEEPALIVE_URL || 'about:blank';
 
 const SESSION_TIMEOUT_MS = CONFIG.sessionTimeoutMs;
 const MAX_SNAPSHOT_NODES = 500;
@@ -424,42 +463,70 @@ if (proxyPool) {
 }
 
 const BROWSER_IDLE_TIMEOUT_MS = CONFIG.browserIdleTimeoutMs;
-let browserIdleTimer = null;
-let browserLaunchPromise = null;
-let browserWarmRetryTimer = null;
+function getBrowserEntry(userId) {
+  const key = normalizeUserId(userId);
+  let entry = browsers.get(key);
+  if (!entry) {
+    entry = {
+      key,
+      browser: null,
+      idleTimer: null,
+      launchPromise: null,
+      warmRetryTimer: null,
+      virtualDisplay: null,
+      launchProxy: null,
+      persona: null,
+    };
+    browsers.set(key, entry);
+  }
+  return entry;
+}
 
-function scheduleBrowserIdleShutdown() {
-  clearBrowserIdleTimer();
-  if (sessions.size === 0 && browser) {
-    browserIdleTimer = setTimeout(async () => {
-      if (sessions.size === 0 && browser) {
-        log('info', 'browser idle shutdown (no sessions)');
-        const b = browser;
-        browser = null;
-        await b.close().catch(() => {});
-      }
-    }, BROWSER_IDLE_TIMEOUT_MS);
+function clearBrowserIdleTimer(userId) {
+  const entry = browsers.get(normalizeUserId(userId));
+  if (entry?.idleTimer) {
+    clearTimeout(entry.idleTimer);
+    entry.idleTimer = null;
   }
 }
 
-function clearBrowserIdleTimer() {
-  if (browserIdleTimer) {
-    clearTimeout(browserIdleTimer);
-    browserIdleTimer = null;
+function scheduleBrowserIdleShutdown(userId) {
+  const key = normalizeUserId(userId);
+  const entry = browsers.get(key);
+  if (!entry?.browser || sessions.has(key)) return;
+  clearBrowserIdleTimer(key);
+  entry.idleTimer = setTimeout(async () => {
+    if (sessions.has(key) || !entry.browser) return;
+    log('info', 'browser idle shutdown (user browser idle)', { userId: key });
+    const b = entry.browser;
+    entry.browser = null;
+    await b.close().catch(() => {});
+    if (!entry.launchPromise && !entry.browser && !entry.idleTimer) {
+      browsers.delete(key);
+    }
+  }, BROWSER_IDLE_TIMEOUT_MS);
+}
+
+function clearBrowserWarmRetry(userId) {
+  const entry = browsers.get(normalizeUserId(userId));
+  if (entry?.warmRetryTimer) {
+    clearTimeout(entry.warmRetryTimer);
+    entry.warmRetryTimer = null;
   }
 }
 
-function scheduleBrowserWarmRetry(delayMs = 5000) {
-  if (browserWarmRetryTimer || browser || browserLaunchPromise) return;
-  browserWarmRetryTimer = setTimeout(async () => {
-    browserWarmRetryTimer = null;
+function scheduleBrowserWarmRetry(userId, delayMs = 5000) {
+  const entry = getBrowserEntry(userId);
+  if (entry.warmRetryTimer || entry.browser || entry.launchPromise) return;
+  entry.warmRetryTimer = setTimeout(async () => {
+    entry.warmRetryTimer = null;
     try {
       const start = Date.now();
-      await ensureBrowser();
-      log('info', 'background browser warm retry succeeded', { ms: Date.now() - start });
+      await ensureBrowser(userId);
+      log('info', 'background browser warm retry succeeded', { userId: entry.key, ms: Date.now() - start });
     } catch (err) {
-      log('warn', 'background browser warm retry failed', { error: err.message, nextDelayMs: delayMs });
-      scheduleBrowserWarmRetry(Math.min(delayMs * 2, 30000));
+      log('warn', 'background browser warm retry failed', { userId: entry.key, error: err.message, nextDelayMs: delayMs });
+      scheduleBrowserWarmRetry(entry.key, Math.min(delayMs * 2, 30000));
     }
   }, delayMs);
 }
@@ -490,13 +557,16 @@ async function restartBrowser(reason) {
   pluginEvents.emit('browser:restart', { reason });
   try {
     await closeAllSessions(`browser_restart:${reason}`, { clearDownloads: true, clearLocks: true });
-    if (browser) {
-      await browser.close().catch(() => {});
-      browser = null;
+    for (const entry of browsers.values()) {
+      clearBrowserIdleTimer(entry.key);
+      clearBrowserWarmRetry(entry.key);
+      if (entry.browser) {
+        await entry.browser.close().catch(() => {});
+      }
+      entry.browser = null;
+      entry.launchPromise = null;
     }
     pluginEvents.emit('browser:closed', { reason });
-    browserLaunchPromise = null;
-    await ensureBrowser();
     healthState.consecutiveNavFailures = 0;
     healthState.lastSuccessfulNav = Date.now();
     log('info', 'browser restarted successfully');
@@ -510,18 +580,55 @@ async function restartBrowser(reason) {
 function getTotalTabCount() {
   let total = 0;
   for (const session of sessions.values()) {
-    for (const group of session.tabGroups.values()) {
-      total += group.size;
-    }
+    for (const group of session.tabGroups.values()) total += group.size;
   }
   return total;
 }
 
-// Virtual display for WebGL support and anti-detection.
-// Xvfb gives Firefox a real X display with GLX, enabling software-rendered WebGL
-// via Mesa llvmpipe. Without this, WebGL returns "no context" — a massive bot signal.
-let virtualDisplay = null;
-let browserLaunchProxy = null;
+function getConnectedBrowserCount() {
+  let total = 0;
+  for (const entry of browsers.values()) {
+    if (entry.browser?.isConnected?.()) total += 1;
+  }
+  return total;
+}
+
+
+
+function createPersistedLaunchProfile(userId) {
+  const persona = buildBrowserPersona(userId);
+  return {
+    version: 1,
+    persona,
+    launchConstraints: {
+      os: persona.os,
+      locale: persona.locale,
+      screen: persona.launchScreenConstraints,
+      window: persona.window,
+    },
+    contextDefaults: {
+      locale: persona.locale,
+      timezoneId: persona.timezoneId,
+      geolocation: persona.geolocation,
+      viewport: persona.viewport,
+    },
+  };
+}
+
+async function resolveLaunchProfile(userId) {
+  const persisted = await loadPersistedBrowserProfile(BROWSER_PROFILE_DIR, userId, { warn: (msg, fields) => log('warn', msg, fields) });
+  if (persisted?.launchConstraints && persisted?.contextDefaults) {
+    return persisted;
+  }
+  const profile = createPersistedLaunchProfile(userId);
+  await persistBrowserProfile({
+    profileDir: BROWSER_PROFILE_DIR,
+    userId,
+    profile,
+    logger: { warn: (msg, fields) => log('warn', msg, fields) },
+  });
+  return profile;
+}
 
 async function probeGoogleSearch(candidateBrowser) {
   let context = null;
@@ -547,26 +654,29 @@ async function probeGoogleSearch(candidateBrowser) {
   }
 }
 
-function attachBrowserCleanup(candidateBrowser, localVirtualDisplay) {
+function attachBrowserCleanup(entry, candidateBrowser, localVirtualDisplay) {
   const origClose = candidateBrowser.close.bind(candidateBrowser);
   candidateBrowser.close = async (...args) => {
     await origClose(...args);
-    browserLaunchProxy = null;
+    entry.browser = null;
+    entry.launchProxy = null;
     if (localVirtualDisplay) {
       localVirtualDisplay.kill();
-      if (virtualDisplay === localVirtualDisplay) virtualDisplay = null;
+      if (entry.virtualDisplay === localVirtualDisplay) entry.virtualDisplay = null;
     }
+    if (!sessions.has(entry.key) && !entry.launchPromise) browsers.delete(entry.key);
   };
 }
 
-async function launchBrowserInstance() {
-  const hostOS = getHostOS();
+async function launchBrowserInstance(userId) {
+  const entry = getBrowserEntry(userId);
+  const launchProfile = await resolveLaunchProfile(userId);
   const maxAttempts = proxyPool?.launchRetries ?? 1;
   let lastError = null;
 
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
     const launchProxy = proxyPool
-      ? proxyPool.getLaunchProxy(proxyPool.canRotateSessions ? `browser-${crypto.randomUUID().replace(/-/g, '').slice(0, 12)}` : undefined)
+      ? proxyPool.getLaunchProxy(proxyPool.canRotateSessions ? `${entry.key}-${crypto.randomUUID().replace(/-/g, '').slice(0, 12)}` : undefined)
       : null;
 
     let localVirtualDisplay = null;
@@ -586,7 +696,10 @@ async function launchBrowserInstance() {
 
     const useVirtualDisplay = !!vdDisplay;
     log('info', 'launching camoufox', {
-      hostOS,
+      userId: entry.key,
+      personaOs: launchProfile.launchConstraints.os,
+      personaLocale: launchProfile.launchConstraints.locale,
+      personaScreen: launchProfile.persona?.screen || null,
       attempt,
       maxAttempts,
       geoip: !!launchProxy,
@@ -600,7 +713,10 @@ async function launchBrowserInstance() {
     try {
       const options = await launchOptions({
         headless: useVirtualDisplay ? false : true,
-        os: hostOS,
+        os: launchProfile.launchConstraints.os,
+        locale: launchProfile.launchConstraints.locale,
+        screen: launchProfile.launchConstraints.screen,
+        window: launchProfile.launchConstraints.window,
         humanize: true,
         enable_cache: true,
         proxy: launchProxy,
@@ -635,13 +751,15 @@ async function launchBrowserInstance() {
         }
       }
 
-      virtualDisplay = localVirtualDisplay;
-      browserLaunchProxy = launchProxy;
-      browser = candidateBrowser;
-      attachBrowserCleanup(browser, localVirtualDisplay);
-      pluginEvents.emit('browser:launched', { browser, display: vdDisplay });
+      entry.virtualDisplay = localVirtualDisplay;
+      entry.launchProxy = launchProxy;
+      entry.persona = launchProfile;
+      entry.browser = candidateBrowser;
+      attachBrowserCleanup(entry, entry.browser, localVirtualDisplay);
+      pluginEvents.emit('browser:launched', { browser: entry.browser, display: vdDisplay, userId: entry.key, persona: launchProfile.persona });
 
       log('info', 'camoufox launched', {
+        userId: entry.key,
         attempt,
         maxAttempts,
         virtualDisplay: useVirtualDisplay,
@@ -649,10 +767,11 @@ async function launchBrowserInstance() {
         proxyServer: launchProxy?.server || null,
         proxySession: launchProxy?.sessionId || null,
       });
-      return browser;
+      return { browser: entry.browser, launchProxy, persona: launchProfile };
     } catch (err) {
       lastError = err;
       log('warn', 'camoufox launch attempt failed', {
+        userId: entry.key,
         attempt,
         maxAttempts,
         error: err.message,
@@ -666,30 +785,34 @@ async function launchBrowserInstance() {
   throw lastError || new Error('Failed to launch a usable browser');
 }
 
-async function ensureBrowser() {
-  clearBrowserIdleTimer();
-  if (browser && !browser.isConnected()) {
+async function ensureBrowser(userId = 'default') {
+  const entry = getBrowserEntry(userId);
+  clearBrowserIdleTimer(entry.key);
+  if (entry.browser && !entry.browser.isConnected()) {
     failuresTotal.labels('browser_disconnected', 'internal').inc();
     log('warn', 'browser disconnected, clearing dead sessions and relaunching', {
-      deadSessions: sessions.size,
+      userId: entry.key,
+      deadSessions: sessions.has(entry.key) ? 1 : 0,
     });
-    await closeAllSessions('browser_disconnected', { clearDownloads: true, clearLocks: true });
-    // Clean up virtual display from dead browser before relaunching
-    if (virtualDisplay) {
-      virtualDisplay.kill();
-      virtualDisplay = null;
+    const deadSession = sessions.get(entry.key);
+    if (deadSession) {
+      await closeSession(entry.key, deadSession, { reason: 'browser_disconnected', clearDownloads: true, clearLocks: true });
     }
-    browserLaunchProxy = null;
-    browser = null;
+    if (entry.virtualDisplay) {
+      entry.virtualDisplay.kill();
+      entry.virtualDisplay = null;
+    }
+    entry.launchProxy = null;
+    entry.browser = null;
   }
-  if (browser) return browser;
-  if (browserLaunchPromise) return browserLaunchPromise;
+  if (entry.browser) return { browser: entry.browser, launchProxy: entry.launchProxy, persona: entry.persona };
+  if (entry.launchPromise) return entry.launchPromise;
   const launchTimeoutMs = proxyPool?.launchTimeoutMs ?? 60000;
-  browserLaunchPromise = Promise.race([
-    launchBrowserInstance(),
+  entry.launchPromise = Promise.race([
+    launchBrowserInstance(entry.key),
     new Promise((_, reject) => setTimeout(() => reject(new Error(`Browser launch timeout (${Math.round(launchTimeoutMs / 1000)}s)`)), launchTimeoutMs)),
-  ]).finally(() => { browserLaunchPromise = null; });
-  return browserLaunchPromise;
+  ]).finally(() => { entry.launchPromise = null; });
+  return entry.launchPromise;
 }
 
 // Helper to normalize userId to string (JSON body may parse as number)
@@ -726,6 +849,11 @@ async function closeSession(userId, session, {
     await clearSessionDownloads(session).catch(() => {});
   }
 
+  await pluginEvents.emitAsync('session:destroying', {
+    userId: key,
+    reason,
+    context: session.context,
+  });
   await session.context.close().catch(() => {});
   sessions.delete(key);
   await pluginEvents.emitAsync('session:destroyed', { userId: key, reason });
@@ -770,17 +898,19 @@ async function getSession(userId) {
       if (sessions.size >= MAX_SESSIONS) {
         throw new Error('Maximum concurrent sessions reached');
       }
-      const b = await ensureBrowser();
+      const { browser: b, launchProxy: launchBrowserProxy, persona: launchPersona } = await ensureBrowser(key);
       const contextOptions = {
-        viewport: { width: 1280, height: 720 },
+        viewport: launchPersona?.contextDefaults?.viewport || { width: 1280, height: 720 },
         permissions: ['geolocation'],
       };
-      // When geoip is active (proxy configured), camoufox auto-configures
-      // locale/timezone/geolocation from the proxy IP. Without proxy, use defaults.
-      if (!CONFIG.proxy.host) {
-        contextOptions.locale = 'en-US';
-        contextOptions.timezoneId = 'America/Los_Angeles';
-        contextOptions.geolocation = { latitude: 37.7749, longitude: -122.4194 };
+      if (launchPersona?.contextDefaults?.locale) {
+        contextOptions.locale = launchPersona.contextDefaults.locale;
+      }
+      if (launchPersona?.contextDefaults?.timezoneId) {
+        contextOptions.timezoneId = launchPersona.contextDefaults.timezoneId;
+      }
+      if (launchPersona?.contextDefaults?.geolocation) {
+        contextOptions.geolocation = launchPersona.contextDefaults.geolocation;
       }
       let sessionProxy = null;
       if (proxyPool?.canRotateSessions) {
@@ -795,20 +925,66 @@ async function getSession(userId) {
       await pluginEvents.emitAsync('session:creating', { userId: key, contextOptions });
       const context = await b.newContext(contextOptions);
       
-      const created = { context, tabGroups: new Map(), lastAccess: Date.now(), proxySessionId: sessionProxy?.sessionId || null };
+      const created = {
+        context,
+        tabGroups: new Map(),
+        lastAccess: Date.now(),
+        proxySessionId: sessionProxy?.sessionId || null,
+        browserProxySessionId: launchBrowserProxy?.sessionId || null,
+      };
       sessions.set(key, created);
       await pluginEvents.emitAsync('session:created', { userId: key, context });
       log('info', 'session created', {
         userId: key,
         proxyMode: proxyPool?.mode || null,
-        proxyServer: sessionProxy?.server || browserLaunchProxy?.server || null,
-        proxySession: sessionProxy?.sessionId || browserLaunchProxy?.sessionId || null,
+        proxyServer: sessionProxy?.server || launchBrowserProxy?.server || null,
+        proxySession: sessionProxy?.sessionId || launchBrowserProxy?.sessionId || null,
       });
       return created;
     });
   }
   session.lastAccess = Date.now();
   return session;
+}
+
+async function ensureKeepaliveTab() {
+  if (!KEEPALIVE_USER_ID) return null;
+  const userId = normalizeUserId(KEEPALIVE_USER_ID);
+  const session = await getSession(userId);
+  const group = getTabGroup(session, KEEPALIVE_SESSION_KEY);
+  for (const [tabId, tabState] of group) {
+    if (tabState?.page && !tabState.page.isClosed()) {
+      tabState.keepAlive = true;
+      tabState._lastReaperCheck = Date.now();
+      tabState._lastReaperToolCalls = tabState.toolCalls;
+      return { tabId, url: tabState.page.url() };
+    }
+    group.delete(tabId);
+    const lock = tabLocks.get(tabId);
+    if (lock) lock.drain();
+    tabLocks.delete(tabId);
+  }
+
+  const page = await session.context.newPage();
+  const tabId = fly.makeTabId();
+  const tabState = createTabState(page, { keepAlive: true });
+  attachDownloadListener(tabState, tabId, log, pluginEvents, userId);
+  group.set(tabId, tabState);
+  refreshActiveTabsGauge();
+
+  if (KEEPALIVE_URL) {
+    const urlErr = validateUrl(KEEPALIVE_URL);
+    if (urlErr) throw new Error(urlErr);
+    tabState.lastRequestedUrl = KEEPALIVE_URL;
+    await withPageLoadDuration('keepalive_open_url', () => page.goto(KEEPALIVE_URL, { waitUntil: 'domcontentloaded', timeout: 30000 })).catch((err) => {
+      log('warn', 'keepalive tab initial navigation failed', { userId, tabId, url: KEEPALIVE_URL, error: err.message });
+    });
+    tabState.visitedUrls.add(KEEPALIVE_URL);
+  }
+
+  pluginEvents.emit('tab:created', { userId, tabId, page, url: page.url(), keepAlive: true });
+  log('info', 'keepalive tab ready', { userId, sessionKey: KEEPALIVE_SESSION_KEY, tabId, url: page.url() });
+  return { tabId, url: page.url() };
 }
 
 function getTabGroup(session, listItemId) {
@@ -979,7 +1155,7 @@ function findTab(session, tabId) {
   return null;
 }
 
-function createTabState(page) {
+function createTabState(page, options = {}) {
   return {
     page,
     refs: new Map(),
@@ -991,6 +1167,41 @@ function createTabState(page) {
     lastRequestedUrl: null,
     googleRetryCount: 0,
     navigateAbort: null,
+    keepAlive: Boolean(options.keepAlive),
+    agentHistorySteps: [],
+  };
+}
+
+function recordTabAction(tabState, action) {
+  recordSuccessfulBrowserAction(tabState, action).catch((err) => {
+    log('warn', 'agent history record failed', { error: err.message, kind: action?.kind });
+  });
+}
+
+async function adoptPopupIntoTab(tabState, popupPage, {
+  previousPage = null,
+  waitForLoadStateTimeoutMs = 3000,
+} = {}) {
+  if (!tabState || !popupPage || popupPage.isClosed()) return null;
+  try {
+    await popupPage.waitForLoadState('domcontentloaded', { timeout: waitForLoadStateTimeoutMs }).catch(() => {});
+  } catch {}
+  await popupPage.waitForTimeout(200).catch(() => {});
+
+  tabState.page = popupPage;
+  tabState.lastSnapshot = null;
+  tabState.refs = new Map();
+  const popupUrl = popupPage.url();
+  if (popupUrl) tabState.visitedUrls.add(popupUrl);
+
+  if (previousPage && previousPage !== popupPage && !previousPage.isClosed()) {
+    await safePageClose(previousPage);
+  }
+
+  return {
+    adopted: true,
+    url: popupUrl,
+    title: await popupPage.title().catch(() => ''),
   };
 }
 
@@ -1212,21 +1423,22 @@ async function extractGoogleSerp(page) {
     const elements = [];
     let refCounter = 1;
     
-    function addRef(role, name) {
+    function addRef(role, name, extra = {}) {
       const id = 'e' + refCounter++;
-      elements.push({ id, role, name });
+      elements.push({ id, role, name, ...extra });
       return id;
     }
     
-    snapshot.push('- heading "' + document.title.replace(/"/g, '\\"') + '"');
+    snapshot.push('- heading "' + document.title.replace(/\"/g, '\\\"') + '"');
     
-    const searchInput = document.querySelector('input[name="q"], textarea[name="q"]');
+    const searchInput = document.querySelector('textarea[name="q"], input[name="q"]:not([type="hidden"])');
     if (searchInput) {
       const name = 'Search';
-      const refId = addRef('searchbox', name);
+      const selector = searchInput.tagName === 'TEXTAREA' ? 'textarea[name="q"]' : 'input[name="q"]:not([type="hidden"])';
+      const refId = addRef('searchbox', name, { selector });
       snapshot.push('- searchbox "' + name + '" [' + refId + ']: ' + (searchInput.value || ''));
     }
-    
+
     const navContainer = document.querySelector('div[role="navigation"], div[role="list"]');
     if (navContainer) {
       const navLinks = navContainer.querySelectorAll('a');
@@ -1321,7 +1533,7 @@ async function extractGoogleSerp(page) {
     const key = `${el.role}:${el.name}`;
     const nth = seenCounts.get(key) || 0;
     seenCounts.set(key, nth + 1);
-    refs.set(el.id, { role: el.role, name: el.name, nth });
+    refs.set(el.id, { role: el.role, name: el.name, nth, selector: el.selector || null });
   }
   
   log('info', 'extractGoogleSerp', { elapsed: Date.now() - start, refs: refs.size });
@@ -1463,7 +1675,11 @@ function refToLocator(page, ref, refs) {
   const info = refs.get(ref);
   if (!info) return null;
   
-  const { role, name, nth } = info;
+  const { role, name, nth, selector } = info;
+  if (selector) {
+    return page.locator(selector).first();
+  }
+
   let locator = page.getByRole(role, name ? { name } : undefined);
   
   // Always use .nth() to disambiguate duplicate role+name combinations
@@ -1513,9 +1729,9 @@ app.get('/health', (req, res) => {
   if (healthState.isRecovering) {
     return res.status(503).json({ ok: false, engine: 'camoufox', recovering: true });
   }
-  const running = browser !== null && (browser.isConnected?.() ?? false);
+  const running = getConnectedBrowserCount() > 0;
   if (proxyPool?.canRotateSessions && !running) {
-    scheduleBrowserWarmRetry();
+    scheduleBrowserWarmRetry('health-check');
     return res.status(503).json({
       ok: false,
       engine: 'camoufox',
@@ -1533,6 +1749,7 @@ app.get('/health', (req, res) => {
     activeTabs: getTotalTabCount(),
     activeSessions: sessions.size,
     consecutiveFailures: healthState.consecutiveNavFailures,
+    ...getVncHealthFields(req),
     ...(FLY_MACHINE_ID ? { machineId: FLY_MACHINE_ID } : {}),
   });
 });
@@ -1609,7 +1826,7 @@ app.post('/tabs/:tabId/navigate', async (req, res) => {
     if (!userId) return res.status(400).json({ error: 'userId required' });
 
     const result = await withUserLimit(userId, () => withTimeout((async () => {
-      await ensureBrowser();
+      await ensureBrowser(userId);
       const resolvedSessionKey = sessionKey || listItemId || 'default';
       let session = sessions.get(normalizeUserId(userId));
       let found = session && findTab(session, tabId);
@@ -1711,7 +1928,7 @@ app.post('/tabs/:tabId/navigate', async (req, res) => {
             reqId: req.reqId,
             tabId,
             url: tabState.page.url(),
-            proxySession: browserLaunchProxy?.sessionId || null,
+            proxySession: session.browserProxySessionId || null,
           });
           await recreateTabOnFreshContext();
           await prewarmGoogleHome();
@@ -1735,6 +1952,11 @@ app.post('/tabs/:tabId/navigate', async (req, res) => {
       }, requestTimeoutMs());
     })(), requestTimeoutMs(), 'navigate'));
     
+    {
+      const session = sessions.get(normalizeUserId(req.body.userId));
+      const found = session && findTab(session, tabId);
+      if (found?.tabState) recordTabAction(found.tabState, { kind: 'navigate', url: result.url || req.body.url, result });
+    }
     log('info', 'navigated', { reqId: req.reqId, tabId, url: result.url });
     pluginEvents.emit('tab:navigated', { userId: req.body.userId, tabId, url: result.url, prevUrl: null });
     res.json(result);
@@ -1989,6 +2211,9 @@ app.post('/tabs/:tabId/click', async (req, res) => {
         }
       };
       
+      const sourcePage = tabState.page;
+      const popupPromise = sourcePage.waitForEvent('popup', { timeout: 1500 }).catch(() => null);
+
       if (ref) {
         let locator = refToLocator(tabState.page, ref, tabState.refs);
         if (!locator) {
@@ -2013,6 +2238,21 @@ app.post('/tabs/:tabId/click', async (req, res) => {
         await doClick(locator, true);
       } else {
         await doClick(selector, false);
+      }
+
+      const popupPage = await Promise.race([
+        popupPromise,
+        new Promise((resolve) => setTimeout(() => resolve(null), 1600)),
+      ]);
+      if (popupPage && !popupPage.isClosed()) {
+        const adoptedPopup = await adoptPopupIntoTab(tabState, popupPage, { previousPage: sourcePage });
+        return {
+          ok: true,
+          url: adoptedPopup?.url || tabState.page.url(),
+          title: adoptedPopup?.title || '',
+          refsAvailable: false,
+          popupAdopted: true,
+        };
       }
       
       // If clicking on a Google SERP, wait for potential navigation to complete
@@ -2051,6 +2291,7 @@ app.post('/tabs/:tabId/click', async (req, res) => {
       return { ok: true, url: newUrl, refsAvailable: tabState.refs.size > 0 };
     }));
     
+    recordTabAction(tabState, { kind: 'click', ref: req.body.ref, selector: req.body.selector, result });
     log('info', 'clicked', { reqId: req.reqId, tabId, url: result.url });
     pluginEvents.emit('tab:click', { userId: req.body.userId, tabId, ref: req.body.ref, selector: req.body.selector });
     res.json(result);
@@ -2134,8 +2375,10 @@ app.post('/tabs/:tabId/type', async (req, res) => {
       if (shouldSubmit) await tabState.page.keyboard.press('Enter');
     });
     
+    const result = { ok: true, url: tabState.page.url(), title: await tabState.page.title().catch(() => '') };
+    recordTabAction(tabState, { kind: 'type', ref, selector, text, result });
     pluginEvents.emit('tab:type', { userId: req.body.userId, tabId, text: req.body.text, ref: req.body.ref, mode: req.body.mode || 'fill' });
-    res.json({ ok: true });
+    res.json(result);
   } catch (err) {
     log('error', 'type failed', { reqId: req.reqId, error: err.message });
     if (err.message?.includes('timed out') || err.message?.includes('not an <input>')) {
@@ -2177,8 +2420,10 @@ app.post('/tabs/:tabId/press', async (req, res) => {
       await tabState.page.keyboard.press(key);
     });
     
+    const result = { ok: true, url: tabState.page.url(), title: await tabState.page.title().catch(() => '') };
+    recordTabAction(tabState, { kind: 'press', key, result });
     pluginEvents.emit('tab:press', { userId, tabId, key });
-    res.json({ ok: true });
+    res.json(result);
   } catch (err) {
     log('error', 'press failed', { reqId: req.reqId, error: err.message });
     handleRouteError(err, req, res);
@@ -2201,8 +2446,10 @@ app.post('/tabs/:tabId/scroll', async (req, res) => {
     await tabState.page.mouse.wheel(isVertical ? 0 : delta, isVertical ? delta : 0);
     await tabState.page.waitForTimeout(300);
     
+    const result = { ok: true, url: tabState.page.url(), title: await tabState.page.title().catch(() => '') };
+    recordTabAction(tabState, { kind: 'scroll', direction, amount, result });
     pluginEvents.emit('tab:scroll', { userId, tabId: req.params.tabId, direction, amount });
-    res.json({ ok: true });
+    res.json(result);
   } catch (err) {
     log('error', 'scroll failed', { reqId: req.reqId, error: err.message });
     handleRouteError(err, req, res);
@@ -2238,6 +2485,7 @@ app.post('/tabs/:tabId/back', async (req, res) => {
       return { ok: true, url: tabState.page.url() };
     });
     
+    recordTabAction(tabState, { kind: 'back', result: { ...result, title: await tabState.page.title().catch(() => '') } });
     res.json(result);
   } catch (err) {
     log('error', 'back failed', { reqId: req.reqId, error: err.message });
@@ -2529,7 +2777,7 @@ app.delete('/sessions/:userId', async (req, res) => {
       await closeSession(userId, session, { reason: 'api_delete_session', clearDownloads: true, clearLocks: true });
       log('info', 'session closed', { userId });
     }
-    if (sessions.size === 0) scheduleBrowserIdleShutdown();
+    scheduleBrowserIdleShutdown(userId);
     res.json({ ok: true });
   } catch (err) {
     log('error', 'session close failed', { error: err.message });
@@ -2550,10 +2798,7 @@ setInterval(() => {
       log('info', 'session expired', { userId });
     }
   }
-  // When all sessions gone, start idle timer to kill browser
-  if (sessions.size === 0) {
-    scheduleBrowserIdleShutdown();
-  }
+  for (const userId of Array.from(browsers.keys())) scheduleBrowserIdleShutdown(userId);
   refreshTabLockQueueDepth();
 }, 60_000);
 
@@ -2563,6 +2808,11 @@ setInterval(() => {
   for (const [userId, session] of sessions) {
     for (const [listItemId, group] of session.tabGroups) {
       for (const [tabId, tabState] of group) {
+        if (tabState.keepAlive) {
+          tabState._lastReaperCheck = now;
+          tabState._lastReaperToolCalls = tabState.toolCalls;
+          continue;
+        }
         if (!tabState._lastReaperCheck) {
           tabState._lastReaperCheck = now;
           tabState._lastReaperToolCalls = tabState.toolCalls;
@@ -2596,7 +2846,7 @@ setInterval(() => {
       sessionsExpiredTotal.inc();
     }
   }
-  if (sessions.size === 0) scheduleBrowserIdleShutdown();
+  for (const userId of Array.from(browsers.keys())) scheduleBrowserIdleShutdown(userId);
 }, 60_000);
 
 // =============================================================================
@@ -2606,7 +2856,7 @@ setInterval(() => {
 
 // GET / - Status (passive — does not launch browser)
 app.get('/', (req, res) => {
-  const running = browser !== null && (browser.isConnected?.() ?? false);
+  const running = getConnectedBrowserCount() > 0;
   res.json({ 
     ok: true,
     enabled: true,
@@ -2614,7 +2864,90 @@ app.get('/', (req, res) => {
     engine: 'camoufox',
     browserConnected: running,
     browserRunning: running,
+    activeBrowsers: getConnectedBrowserCount(),
   });
+});
+
+app.post('/memory/record', async (req, res) => {
+  try {
+    const { userId, tabId, targetId, siteKey, actionKey = 'default' } = req.body || {};
+    if (!userId) return res.status(400).json({ error: 'userId is required' });
+    if (!siteKey) return res.status(400).json({ error: 'siteKey is required' });
+    const resolvedTabId = tabId || targetId;
+    if (!resolvedTabId) return res.status(400).json({ error: 'tabId or targetId is required' });
+    const session = sessions.get(normalizeUserId(userId));
+    const found = session && findTab(session, resolvedTabId);
+    if (!found) return res.status(404).json({ error: 'Tab not found' });
+    const saved = await recordAgentHistoryFlow(found.tabState, siteKey, actionKey);
+    res.json({ ok: true, path: saved.path, siteKey, actionKey });
+  } catch (err) {
+    log('error', 'agent history record endpoint failed', { reqId: req.reqId, error: err.message });
+    handleRouteError(err, req, res);
+  }
+});
+
+app.post('/memory/replay', async (req, res) => {
+  try {
+    const { userId, tabId, targetId, siteKey, actionKey = 'default' } = req.body || {};
+    if (!userId) return res.status(400).json({ error: 'userId is required' });
+    if (!siteKey) return res.status(400).json({ error: 'siteKey is required' });
+    const resolvedTabId = tabId || targetId || fly.makeTabId();
+    const session = await getSession(userId);
+    let found = findTab(session, resolvedTabId);
+    if (!found) {
+      const page = await session.context.newPage();
+      const tabState = createTabState(page);
+      attachDownloadListener(tabState, resolvedTabId, log, pluginEvents, userId);
+      getTabGroup(session, 'default').set(resolvedTabId, tabState);
+      refreshActiveTabsGauge();
+      found = findTab(session, resolvedTabId);
+    }
+    const { tabState } = found;
+    const replay = await replayAgentHistory(siteKey, actionKey, {
+      navigate: async (step) => {
+        await tabState.page.goto(step.url, { waitUntil: 'domcontentloaded', timeout: 30000 });
+        tabState.lastSnapshot = null;
+        tabState.refs = await buildRefs(tabState.page);
+        return { ok: true, url: tabState.page.url() };
+      },
+      click: async (step) => {
+        const locator = step.ref ? refToLocator(tabState.page, step.ref, tabState.refs) : tabState.page.locator(step.selector);
+        if (!locator) return { ok: false, error: `Ref not found: ${step.ref}` };
+        await locator.click({ timeout: 10000 });
+        await tabState.page.waitForTimeout(500);
+        tabState.lastSnapshot = null;
+        tabState.refs = await buildRefs(tabState.page);
+        return { ok: true, url: tabState.page.url() };
+      },
+      type: async (step) => {
+        const locator = step.ref ? refToLocator(tabState.page, step.ref, tabState.refs) : null;
+        if (locator) await locator.fill(step.text, { timeout: 10000 });
+        else await tabState.page.fill(step.selector, step.text, { timeout: 10000 });
+        return { ok: true, url: tabState.page.url() };
+      },
+      press: async (step) => {
+        await tabState.page.keyboard.press(step.key);
+        return { ok: true, url: tabState.page.url() };
+      },
+      scroll: async (step) => {
+        const direction = step.direction || 'down';
+        const amount = step.amount || 500;
+        const isVertical = direction === 'up' || direction === 'down';
+        const delta = (direction === 'up' || direction === 'left') ? -amount : amount;
+        await tabState.page.mouse.wheel(isVertical ? 0 : delta, isVertical ? delta : 0);
+        return { ok: true, url: tabState.page.url() };
+      },
+      back: async () => {
+        await tabState.page.goBack({ timeout: 10000 }).catch(() => {});
+        tabState.refs = await buildRefs(tabState.page);
+        return { ok: true, url: tabState.page.url() };
+      },
+    });
+    res.json({ ...replay, targetId: resolvedTabId, tabId: resolvedTabId, url: tabState.page.url() });
+  } catch (err) {
+    log('error', 'agent history replay endpoint failed', { reqId: req.reqId, error: err.message });
+    handleRouteError(err, req, res);
+  }
 });
 
 // GET /tabs - List all tabs (OpenClaw expects this)
@@ -2685,14 +3018,16 @@ app.post('/tabs/open', async (req, res) => {
     await withPageLoadDuration('open_url', () => page.goto(url, { waitUntil: 'domcontentloaded', timeout: 30000 }));
     tabState.visitedUrls.add(url);
     
-    log('info', 'openclaw tab opened', { reqId: req.reqId, tabId, url: page.url() });
-    res.json({ 
+    const result = { 
       ok: true,
       targetId: tabId,
       tabId,
       url: page.url(),
       title: await page.title().catch(() => '')
-    });
+    };
+    recordTabAction(tabState, { kind: 'navigate', url: result.url || url, result });
+    log('info', 'openclaw tab opened', { reqId: req.reqId, tabId, url: page.url() });
+    res.json(result);
   } catch (err) {
     log('error', 'openclaw tab open failed', { reqId: req.reqId, error: err.message });
     handleRouteError(err, req, res);
@@ -2702,7 +3037,8 @@ app.post('/tabs/open', async (req, res) => {
 // POST /start - Start browser (OpenClaw expects this)
 app.post('/start', async (req, res) => {
   try {
-    await ensureBrowser();
+    const userId = normalizeUserId(req.body?.userId || req.query?.userId || 'default');
+    await ensureBrowser(userId);
     res.json({ ok: true, profile: 'camoufox' });
   } catch (err) {
     failuresTotal.labels('browser_launch', 'start').inc();
@@ -2717,9 +3053,21 @@ app.post('/stop', async (req, res) => {
     if (!adminKey || !timingSafeCompare(adminKey, CONFIG.adminKey)) {
       return res.status(403).json({ error: 'Forbidden' });
     }
-    if (browser) {
-      await browser.close().catch(() => {});
-      browser = null;
+    const userId = req.body?.userId || req.query?.userId;
+    if (userId) {
+      const key = normalizeUserId(userId);
+      const entry = browsers.get(key);
+      if (entry?.browser) {
+        await entry.browser.close().catch(() => {});
+        entry.browser = null;
+      }
+    } else {
+      for (const entry of browsers.values()) {
+        if (entry.browser) {
+          await entry.browser.close().catch(() => {});
+          entry.browser = null;
+        }
+      }
     }
     await closeAllSessions('admin_stop', { clearDownloads: true, clearLocks: true });
     res.json({ ok: true, stopped: true, profile: 'camoufox' });
@@ -2766,6 +3114,7 @@ app.post('/navigate', async (req, res) => {
       return { ok: true, targetId, url: tabState.page.url() };
     });
     
+    recordTabAction(tabState, { kind: 'navigate', url: result.url || url, result });
     res.json(result);
   } catch (err) {
     log('error', 'openclaw navigate failed', { reqId: req.reqId, error: err.message });
@@ -3056,6 +3405,19 @@ app.post('/act', async (req, res) => {
       }
     });
     
+    const actionResult = { ...result, url: result.url || tabState.page.url(), title: await tabState.page.title().catch(() => '') };
+    if (['click', 'type', 'press', 'scroll', 'scrollIntoView'].includes(kind)) {
+      recordTabAction(tabState, {
+        kind: kind === 'scrollIntoView' ? 'scroll' : kind,
+        ref: params.ref,
+        selector: params.selector,
+        text: params.text,
+        key: params.key,
+        direction: params.direction,
+        amount: params.amount,
+        result: actionResult,
+      });
+    }
     res.json(result);
   } catch (err) {
     log('error', 'act failed', { reqId: req.reqId, kind: req.body?.kind, error: err.message });
@@ -3078,13 +3440,15 @@ setInterval(() => {
     rssBytes: mem.rss,
     heapUsedBytes: mem.heapUsed,
     uptimeSeconds: Math.floor(process.uptime()),
-    browserConnected: browser?.isConnected() ?? false,
+    browserConnected: getConnectedBrowserCount() > 0,
+    activeBrowsers: getConnectedBrowserCount(),
   });
 }, 5 * 60_000);
 
 // Active health probe — detect hung browser even when isConnected() lies
 setInterval(async () => {
-  if (!browser || healthState.isRecovering) return;
+  const entry = Array.from(browsers.values()).find((candidate) => candidate.browser?.isConnected?.());
+  if (!entry?.browser || healthState.isRecovering) return;
   const timeSinceSuccess = Date.now() - healthState.lastSuccessfulNav;
   // Skip probe if operations are in flight AND last success was recent.
   // If it's been >120s since any successful operation, probe anyway —
@@ -3101,7 +3465,7 @@ setInterval(async () => {
   
   let testContext;
   try {
-    testContext = await browser.newContext();
+    testContext = await entry.browser.newContext();
     const page = await testContext.newPage();
     await page.goto('about:blank', { timeout: 5000 });
     await page.close();
@@ -3148,7 +3512,9 @@ async function gracefulShutdown(signal) {
     clearLocks: false,
   });
 
-  if (browser) await browser.close().catch(() => {});
+  for (const entry of browsers.values()) {
+    if (entry.browser) await entry.browser.close().catch(() => {});
+  }
   process.exit(0);
 }
 
@@ -3205,15 +3571,25 @@ const server = app.listen(PORT, async () => {
   if (tmpCleanup.removed > 0) {
     log('info', 'cleaned up orphaned camoufox temp files', tmpCleanup);
   }
-  // Pre-warm browser so first request doesn't eat a 6-7s cold start
+  // Pre-warm a default browser so first request doesn't eat a cold start.
   try {
     const start = Date.now();
-    await ensureBrowser();
-    log('info', 'browser pre-warmed', { ms: Date.now() - start });
-    scheduleBrowserIdleShutdown();
+    await ensureBrowser('default');
+    log('info', 'browser pre-warmed', { userId: 'default', ms: Date.now() - start });
+    scheduleBrowserIdleShutdown('default');
   } catch (err) {
     log('error', 'browser pre-warm failed (will retry in background)', { error: err.message });
-    scheduleBrowserWarmRetry();
+    scheduleBrowserWarmRetry('default');
+  }
+  if (KEEPALIVE_USER_ID) {
+    try {
+      await ensureKeepaliveTab();
+    } catch (err) {
+      log('error', 'keepalive tab startup failed (will retry)', { userId: KEEPALIVE_USER_ID, error: err.message });
+    }
+    setInterval(() => {
+      ensureKeepaliveTab().catch((err) => log('error', 'keepalive tab retry failed', { userId: KEEPALIVE_USER_ID, error: err.message }));
+    }, 60_000);
   }
   // Idle self-shutdown removed — Fly manages machine lifecycle via fly.toml.
 });
