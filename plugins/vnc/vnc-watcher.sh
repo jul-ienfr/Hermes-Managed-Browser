@@ -15,6 +15,9 @@ set -e
 VNC_PORT="${VNC_PORT:-5900}"
 NOVNC_PORT="${NOVNC_PORT:-6080}"
 VNC_RESOLUTION="${VNC_RESOLUTION:-1920x1080x24}"
+SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+DEFAULT_NOVNC_DIR="/usr/share/novnc"
+PATCHED_NOVNC_DIR="/tmp/camofox-novnc-web"
 
 log() { printf '[vnc-watcher] %s\n' "$*" >&2; }
 
@@ -32,17 +35,63 @@ else
   log "x11vnc: NO password (bind $NOVNC_PORT to 127.0.0.1 on host + SSH tunnel)"
 fi
 
-# Start noVNC (websockify) — proxies to x11vnc regardless of whether it's up yet
-NOVNC_DIR="/usr/share/novnc"
-if [ ! -d "$NOVNC_DIR" ]; then
-  log "ERROR: $NOVNC_DIR not found; noVNC cannot start"
-  exit 1
-fi
-VNC_BIND="${VNC_BIND:-127.0.0.1}"
-log "Starting noVNC (websockify) on $VNC_BIND:$NOVNC_PORT -> 127.0.0.1:$VNC_PORT"
-websockify --web "$NOVNC_DIR" "$VNC_BIND:$NOVNC_PORT" "127.0.0.1:$VNC_PORT" >/tmp/camofox-novnc.log 2>&1 &
+prepare_novnc_dir() {
+  if [ ! -d "$DEFAULT_NOVNC_DIR" ]; then
+    log "ERROR: $DEFAULT_NOVNC_DIR not found; noVNC cannot start"
+    exit 1
+  fi
 
-log "VNC watcher started — will attach x11vnc when Camoufox's Xvfb appears"
+  rm -rf "$PATCHED_NOVNC_DIR"
+  mkdir -p "$PATCHED_NOVNC_DIR"
+  cp -a "$DEFAULT_NOVNC_DIR"/. "$PATCHED_NOVNC_DIR"/
+
+  if [ -f "$SCRIPT_DIR/novnc-error-handler.patch.js" ] && [ -f "$PATCHED_NOVNC_DIR/vnc.html" ]; then
+    cp "$SCRIPT_DIR/novnc-error-handler.patch.js" "$PATCHED_NOVNC_DIR/app/novnc-error-handler.patch.js"
+    python3 - "$PATCHED_NOVNC_DIR/vnc.html" <<'PY'
+from pathlib import Path
+import sys
+path = Path(sys.argv[1])
+html = path.read_text()
+patch_script = '    <script src="app/novnc-error-handler.patch.js"></script>\n'
+anchor = '    <script src="app/error-handler.js"></script>\n'
+if patch_script not in html:
+    if anchor not in html:
+        raise SystemExit('noVNC vnc.html error-handler anchor not found')
+    html = html.replace(anchor, patch_script + anchor, 1)
+path.write_text(html)
+PY
+  fi
+
+  NOVNC_DIR="$PATCHED_NOVNC_DIR"
+}
+
+# Start/keep noVNC (websockify) — proxies to x11vnc regardless of whether it's up yet.
+# A one-shot launch can fail with EADDRINUSE during restart, then leave noVNC down
+# later if the old websockify exits. Keep the listener supervised here.
+prepare_novnc_dir
+VNC_BIND="${VNC_BIND:-127.0.0.1}"
+WEBSOCKIFY_PID=""
+
+port_listening() {
+  ss -ltn 2>/dev/null | awk '{print $4}' | grep -Eq "(^|:)${NOVNC_PORT}$"
+}
+
+start_websockify() {
+  if port_listening; then
+    return 0
+  fi
+  log "Starting noVNC (websockify) on $VNC_BIND:$NOVNC_PORT -> 127.0.0.1:$VNC_PORT"
+  websockify --web "$NOVNC_DIR" "$VNC_BIND:$NOVNC_PORT" "127.0.0.1:$VNC_PORT" >/tmp/camofox-novnc.log 2>&1 &
+  WEBSOCKIFY_PID="$!"
+  sleep 1
+  if ! kill -0 "$WEBSOCKIFY_PID" 2>/dev/null && ! port_listening; then
+    log "WARNING: websockify failed to stay up; will retry"
+    WEBSOCKIFY_PID=""
+  fi
+}
+
+start_websockify
+log "VNC watcher started — will attach x11vnc when Camoufox's Xvfb appears and keep noVNC alive"
 
 find_visible_camoufox_display() {
   for d in $(ps -eo args= 2>/dev/null | awk -v res="$VNC_RESOLUTION" '
@@ -61,6 +110,8 @@ find_visible_camoufox_display() {
 }
 
 while true; do
+  start_websockify
+
   # Prefer the Xvfb display that actually contains a visible browser window.
   # With multiple Camoufox/Xvfb instances, picking the first display can attach
   # VNC to a hidden 10x10/blank browser and noVNC looks black.
