@@ -1,0 +1,159 @@
+{
+  "mode": "supervised_browser_only",
+  "location": {
+    "label": "Bogève",
+    "latitude": null,
+    "longitude": null,
+    "radiusKm": 20
+  },
+  "budget": {
+    "idealPurchaseMin": 20,
+    "idealPurchaseMax": 150,
+    "maxPurchasePriceWithoutValidation": 250,
+    "maxPurchasePriceHard": 250,
+    "maxTotalExposure": 500,
+    "reserveCash": 50
+  },
+  "supervision": {
+    "requireValidationBeforeMessage": true,
+    "requireValidationBeforePurchase": true,
+    "allowAutonomousPurchase": false,
+    "allowAutonomousPayment": false,
+    "allowAutonomousPersonalDataSharing": false
+  },
+  "browserPolicy": {
+    "browserOnly": true,
+    "forbidDirectLeboncoinApi": true,
+    "forbidHiddenEndpoints": true,
+    "forbidInternalApiScraping": true,
+    "allowedCollectionMode": "manual_vnc_observation"
+  },
+  "storage": {
+    "phase": 1,
+    "maxBulkiness": "small",
+    "maxFragility": "medium",
+    "maxStorageDays": 21,
+    "smallObjectsOnly": true,
+    "fitRule": "must_fit_closet_shelf_or_car_trunk",
+    "exceptionRequiresExceptionalMargin": true,
+    "exceptionalMarginNetProfit": 120,
+    "exceptionalMarginPercent": 60,
+    "bannedAttributes": [
+      "requires_two_people",
+      "requires_vehicle",
+      "oversized",
+      "long_storage_expected",
+      "fragile_large_shipping"
+    ]
+  },
+  "categories": {
+    "allowed": [
+      "consoles",
+      "controllers",
+      "video_games",
+      "smartphones",
+      "tablets",
+      "audio_headphones",
+      "compact_power_tools",
+      "tool_batteries",
+      "tool_chargers",
+      "photo_accessories",
+      "computer_accessories",
+      "babyphones",
+      "compact_premium_baby_items"
+    ],
+    "banned": [
+      "furniture",
+      "mattresses",
+      "large_appliances",
+      "adult_bikes",
+      "large_tvs",
+      "bulky_lots",
+      "large_fragile_shipping",
+      "vehicles",
+      "real_estate",
+      "animals",
+      "services"
+    ],
+    "exceptionalOnly": [
+      "yoyo_stroller",
+      "cybex_compact_stroller",
+      "small_medium_screens"
+    ]
+  },
+  "margins": {
+    "minGrossMarginPercent": 30,
+    "targetGrossMarginPercent": 50,
+    "minNetProfit": 20,
+    "platformFeePercent": 0,
+    "repairCostBuffer": 5,
+    "netProfitByPurchaseBand": [
+      { "maxPrice": 50, "minNetProfit": 20 },
+      { "maxPrice": 150, "minNetProfit": 40 },
+      { "maxPrice": 250, "minNetProfit": 70 },
+      { "maxPrice": null, "minNetProfit": 120 }
+    ]
+  },
+  "scoring": {
+    "buyDirectScore": 85,
+    "negotiateScore": 70,
+    "watchScore": 50,
+    "ignoreBelowScore": 50,
+    "weights": {
+      "margin": 0.3,
+      "demand": 0.18,
+      "resaleSpeed": 0.18,
+      "risk": 0.14,
+      "distance": 0.08,
+      "bulkiness": 0.06,
+      "fragility": 0.03,
+      "storageTime": 0.03
+    }
+  },
+  "listingAgeBuckets": [
+    { "name": "fresh", "maxDays": 2, "stalenessScore": 0.1, "negotiationAggression": "none" },
+    { "name": "normal", "maxDays": 14, "stalenessScore": 0.35, "negotiationAggression": "standard" },
+    { "name": "stale", "maxDays": 45, "stalenessScore": 0.75, "negotiationAggression": "aggressive" },
+    { "name": "very_stale", "maxDays": null, "stalenessScore": 1, "negotiationAggression": "very_aggressive" }
+  ],
+  "specialRules": {
+    "overpriced_but_stale": {
+      "enabled": true,
+      "minAgeDays": 14,
+      "overpricedRatio": 1.05,
+      "openingOfferDiscountPercent": 20,
+      "abandonIfCounterAboveProfitableCeiling": true
+    },
+    "excellent_deal_no_negotiation": {
+      "enabled": true,
+      "minNetProfit": 80,
+      "minGrossMarginPercent": 50,
+      "maxRiskScore": 0.35
+    }
+  },
+  "searches": [
+    { "query": "Nintendo Switch", "category": "consoles", "maxPrice": 180 },
+    { "query": "Switch OLED", "category": "consoles", "maxPrice": 230 },
+    { "query": "PS5", "category": "consoles", "maxPrice": 300 },
+    { "query": "PS4 lot", "category": "consoles", "maxPrice": 180 },
+    { "query": "manette PS5", "category": "controllers", "maxPrice": 45 },
+    { "query": "Makita", "category": "compact_power_tools", "maxPrice": 180 },
+    { "query": "Bosch Pro", "category": "compact_power_tools", "maxPrice": 180 },
+    { "query": "DeWalt", "category": "compact_power_tools", "maxPrice": 180 },
+    { "query": "Milwaukee", "category": "compact_power_tools", "maxPrice": 180 },
+    { "query": "iPad", "category": "tablets", "maxPrice": 250 },
+    { "query": "GoPro", "category": "photo_accessories", "maxPrice": 180 },
+    { "query": "Bose", "category": "audio_headphones", "maxPrice": 150 },
+    { "query": "Sony WH", "category": "audio_headphones", "maxPrice": 150 },
+    { "query": "babyphone caméra", "category": "babyphones", "maxPrice": 100 },
+    { "query": "Ergobaby", "category": "compact_premium_baby_items", "maxPrice": 80 }
+  ],
+  "messageTemplates": {
+    "buyDirect": "Bonjour, votre annonce m’intéresse. Je peux vous le prendre au prix indiqué et venir rapidement. Est-il toujours disponible ?",
+    "askAvailability": "Bonjour, votre annonce est-elle toujours disponible ?",
+    "negotiateAggressive": "Bonjour, je peux venir rapidement. Vu l'ancienneté de l'annonce, accepteriez-vous {offer} € ?",
+    "negotiateStandard": "Bonjour, je suis intéressé. Est-ce que vous accepteriez {offer} € si je viens rapidement ?",
+    "abandonCounterAboveCeiling": "Je comprends, je vais passer à ce prix-là. Si jamais vous changez d’avis, je peux venir rapidement.",
+    "askTestableCondition": "Bonjour, est-ce que l’objet fonctionne parfaitement ? Est-il possible de le tester sur place ?"
+  }
+}
