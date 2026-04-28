@@ -10,9 +10,9 @@ import { expandMacro } from './lib/macros.js';
 import { loadConfig } from './lib/config.js';
 import { normalizePlaywrightProxy, createProxyPool, buildProxyUrl } from './lib/proxy.js';
 import { createFlyHelpers } from './lib/fly.js';
-import { createPluginEvents, loadPlugins } from './lib/plugins.js';
+import { createPluginEvents, loadPlugins, readPluginConfig } from './lib/plugins.js';
 import { requireAuth, timingSafeCompare as _timingSafeCompare, isLoopbackAddress as _isLoopbackAddress } from './lib/auth.js';
-import { windowSnapshot } from './lib/snapshot.js';
+import { windowSnapshot, compactSnapshot } from './lib/snapshot.js';
 import {
   MAX_DOWNLOAD_INLINE_BYTES,
   clearTabDownloads,
@@ -21,10 +21,27 @@ import {
   getDownloadsList,
 } from './lib/downloads.js';
 import { extractPageImages } from './lib/images.js';
+import { buildTargetContext } from './lib/action-context.js';
+import { validateOutcome } from './lib/outcome-validation.js';
+import { adaptivePacingForInterrupt, detectInterrupt, chooseCookieConsentCandidate } from './lib/interrupt-handlers.js';
+import { candidatesFromRefs } from './lib/target-repair.js';
+import { replayStepsSelfHealing } from './lib/self-healing-replay.js';
+import { createMemoryReplayHandlers } from './lib/memory-replay-handlers.js';
+import { createManagedPlannerFallback, explicitAllowLlmRepair } from './lib/managed-llm-repair.js';
 import {
+  createManagedRecoveryRegistry,
+  getRecoveryState,
+  getRecoveryTargetUrl,
+  markRecoveryClosed,
+  recordRecoveryAction,
+} from './lib/managed-recovery-registry.js';
+import {
+  deleteFlow as deleteAgentHistoryFlow,
+  loadAgentHistory,
+  persistAgentHistorySteps,
   recordFlow as recordAgentHistoryFlow,
   recordSuccessfulBrowserAction,
-  replayAgentHistory,
+  searchFlows,
 } from './lib/agent-history-memory.js';
 
 import {
@@ -38,10 +55,20 @@ import {
   loadPersistedBrowserProfile,
   persistBrowserProfile,
 } from './lib/persistence.js';
+import { listManagedBrowserProfiles } from './lib/managed-browser-policy.js';
 import { buildBrowserPersona } from './lib/browser-persona.js';
+import { buildHumanBehaviorPersona } from './lib/human-behavior-persona.js';
+import { resolveBrowserDisplayMode } from './lib/browser-display-mode.js';
+import { recordVncDisplay, removeVncDisplay, readSelectedVncUserId } from './lib/vnc-display-registry.js';
+import { shouldStartKeepalive } from './lib/keepalive-policy.js';
+import { humanClick, humanType, humanPress, humanScroll, humanPrepareTarget, humanMove } from './lib/human-actions.js';
+import { createHumanSessionState, getHumanCursor, updateHumanCursor } from './lib/human-session-state.js';
 
 const CONFIG = loadConfig();
-const VNC_HEALTH_INFO = resolveVncConfig(CONFIG.plugins?.vnc || {});
+const PLUGIN_CONFIGS = readPluginConfig().configs;
+const VNC_HEALTH_INFO = resolveVncConfig(PLUGIN_CONFIGS.get('vnc') || {});
+const MANAGED_BROWSER_PROFILES = listManagedBrowserProfiles();
+const MANAGED_BROWSER_PROFILES_BY_USER_ID = new Map(MANAGED_BROWSER_PROFILES.map((policy) => [policy.userId, policy]));
 
 function getVncHealthFields(req) {
   if (!VNC_HEALTH_INFO.enabled) return {};
@@ -54,6 +81,9 @@ function getVncHealthFields(req) {
     vncPort: Number.isFinite(vncPort) ? vncPort : null,
     novncPort: Number.isFinite(novncPort) ? novncPort : null,
     vncViewOnly: Boolean(VNC_HEALTH_INFO.viewOnly),
+    vncHumanOnly: Boolean(VNC_HEALTH_INFO.humanOnly),
+    vncManagedRegistryOnly: Boolean(VNC_HEALTH_INFO.managedRegistryOnly),
+    vncBind: VNC_HEALTH_INFO.bind || '127.0.0.1',
   };
   if (Number.isFinite(novncPort)) {
     fields.novncUrl = `${protocol}://${host}:${novncPort}/vnc.html`;
@@ -287,6 +317,7 @@ const browsers = new Map();
 // TabState = { page, refs: Map<refId, {role, name, nth}>, visitedUrls: Set, downloads: Array, toolCalls: number }
 // Note: sessionKey was previously called listItemId - both are accepted for backward compatibility
 const sessions = new Map();
+const managedRecoveryRegistry = createManagedRecoveryRegistry();
 const BROWSER_PROFILE_DIR = process.env.CAMOFOX_PROFILE_DIR || path.join(os.homedir(), '.camofox', 'profiles');
 const KEEPALIVE_USER_ID = process.env.CAMOFOX_KEEPALIVE_USER_ID || '';
 const KEEPALIVE_SESSION_KEY = process.env.CAMOFOX_KEEPALIVE_SESSION_KEY || 'manual-login';
@@ -306,6 +337,7 @@ const BUILDREFS_TIMEOUT_MS = CONFIG.buildrefsTimeoutMs;
 const FAILURE_THRESHOLD = 3;
 const MAX_CONSECUTIVE_TIMEOUTS = 3;
 const TAB_LOCK_TIMEOUT_MS = 35000; // Must be > HANDLER_TIMEOUT_MS so active op times out first
+const MAX_DIAGNOSTICS_BUFFER = 200;
 
 
 
@@ -386,6 +418,61 @@ function withTimeout(promise, ms, label) {
       setTimeout(() => reject(new Error(`${label} timed out after ${ms}ms`)), ms)
     )
   ]);
+}
+
+function withActionTimeout(promise, ms, label) {
+  return withTimeout(promise, Math.max(1, Number(ms) || 1), label);
+}
+
+function pushDiagnostics(buffer, item) {
+  buffer.push(item);
+  if (buffer.length > MAX_DIAGNOSTICS_BUFFER) buffer.splice(0, buffer.length - MAX_DIAGNOSTICS_BUFFER);
+}
+
+function attachPageDiagnostics(tabState, page) {
+  if (!tabState || !page || page.isClosed?.() || tabState._diagnosticsPage === page) return;
+  if (!Array.isArray(tabState.consoleMessages)) tabState.consoleMessages = [];
+  if (!Array.isArray(tabState.jsErrors)) tabState.jsErrors = [];
+  if (!tabState.diagnosticsTotals) tabState.diagnosticsTotals = { console_messages: 0, js_errors: 0 };
+  tabState._diagnosticsPage = page;
+  page.on('console', (message) => {
+    tabState.diagnosticsTotals.console_messages++;
+    pushDiagnostics(tabState.consoleMessages, {
+      ts: new Date().toISOString(),
+      type: message.type(),
+      text: message.text(),
+      location: message.location(),
+    });
+  });
+  page.on('pageerror', (error) => {
+    tabState.diagnosticsTotals.js_errors++;
+    pushDiagnostics(tabState.jsErrors, {
+      ts: new Date().toISOString(),
+      name: error.name || 'Error',
+      message: error.message || String(error),
+      stack: error.stack || null,
+    });
+  });
+}
+
+function diagnosticsResponse(tabState, clear = false) {
+  const consoleMessages = [...(tabState.consoleMessages || [])];
+  const jsErrors = [...(tabState.jsErrors || [])];
+  const response = {
+    console_messages: consoleMessages,
+    js_errors: jsErrors,
+    total_messages: consoleMessages.length,
+    total_errors: jsErrors.length,
+    totals: {
+      console_messages: tabState.diagnosticsTotals?.console_messages || 0,
+      js_errors: tabState.diagnosticsTotals?.js_errors || 0,
+    },
+  };
+  if (clear) {
+    tabState.consoleMessages = [];
+    tabState.jsErrors = [];
+  }
+  return response;
 }
 
 function requestTimeoutMs(baseMs = HANDLER_TIMEOUT_MS) {
@@ -603,26 +690,37 @@ function createPersistedLaunchProfile(userId) {
     launchConstraints: {
       os: persona.os,
       locale: persona.locale,
-      screen: persona.launchScreenConstraints,
-      window: persona.window,
+      // Keep screen/window/WebGL in the persisted persona/context layer.
+      // Passing them as exact Camoufox launch constraints can make
+      // fingerprint generation fail for managed Leboncoin profiles.
+      screen: null,
+      window: null,
+      webglConfig: null,
     },
     contextDefaults: {
       locale: persona.locale,
       timezoneId: persona.timezoneId,
       geolocation: persona.geolocation,
       viewport: persona.viewport,
+      deviceScaleFactor: persona.deviceScaleFactor,
     },
+    firefoxUserPrefs: persona.firefoxUserPrefs,
   };
 }
 
-async function resolveLaunchProfile(userId) {
-  const persisted = await loadPersistedBrowserProfile(BROWSER_PROFILE_DIR, userId, { warn: (msg, fields) => log('warn', msg, fields) });
+function resolveProfileRoot(profileDir) {
+  return profileDir || BROWSER_PROFILE_DIR;
+}
+
+async function resolveLaunchProfile(userId, { profileDir } = {}) {
+  const profileRoot = resolveProfileRoot(profileDir);
+  const persisted = await loadPersistedBrowserProfile(profileRoot, userId, { warn: (msg, fields) => log('warn', msg, fields) });
   if (persisted?.launchConstraints && persisted?.contextDefaults) {
     return persisted;
   }
   const profile = createPersistedLaunchProfile(userId);
   await persistBrowserProfile({
-    profileDir: BROWSER_PROFILE_DIR,
+    profileDir: profileRoot,
     userId,
     profile,
     logger: { warn: (msg, fields) => log('warn', msg, fields) },
@@ -654,12 +752,52 @@ async function probeGoogleSearch(candidateBrowser) {
   }
 }
 
+function requireSharedDisplayForUser(userId, expectedDisplay) {
+  const normalizedUserId = String(userId);
+  if (!expectedDisplay) return;
+  if (CONFIG.sharedDisplay !== expectedDisplay || !CONFIG.sharedDisplayUserIds.includes(normalizedUserId)) {
+    const allowed = CONFIG.sharedDisplayUserIds.join(',') || 'none';
+    throw Object.assign(
+      new Error(`Managed visible launch for ${normalizedUserId} requires CAMOFOX_SHARED_DISPLAY=${expectedDisplay} and CAMOFOX_SHARED_DISPLAY_USER_IDS including ${normalizedUserId}; current display=${CONFIG.sharedDisplay || 'none'}, allowed=${allowed}.`),
+      { statusCode: 409 }
+    );
+  }
+}
+
+function assertRawTabCreateAllowed(body = {}) {
+  const policy = MANAGED_BROWSER_PROFILES_BY_USER_ID.get(String(body.userId || ''));
+  if (!policy || policy.siteKey !== 'leboncoin') return;
+  const allowed = body.managedBrowser === true &&
+    body.siteKey === policy.siteKey &&
+    body.sessionKey === policy.sessionKey &&
+    body.profileDir === policy.profileDir &&
+    body.browserPersonaKey === policy.browserPersonaKey &&
+    body.humanPersonaKey === policy.humanPersonaKey;
+  if (!allowed) {
+    throw Object.assign(
+      new Error(`Raw tab creation is disabled for managed Leboncoin profile ${policy.profile}; use managed_browser_* tools.`),
+      { statusCode: 403 }
+    );
+  }
+}
+
 function attachBrowserCleanup(entry, candidateBrowser, localVirtualDisplay) {
   const origClose = candidateBrowser.close.bind(candidateBrowser);
   candidateBrowser.close = async (...args) => {
+    const session = sessions.get(entry.key);
+    if (session) {
+      for (const [sessionKey, group] of session.tabGroups || []) {
+        for (const [tabId, tabState] of group) {
+          updateTabRecoveryMeta(tabState, { userId: entry.key, sessionKey, tabId, profileDir: session.profileDir });
+          markTabRecoveryClosed(tabState, { reason: 'browser_closed', url: tabState.page?.url?.() || undefined, title: await tabState.page?.title?.().catch(() => '') || undefined });
+        }
+      }
+    }
     await origClose(...args);
     entry.browser = null;
     entry.launchProxy = null;
+    entry.display = null;
+    removeVncDisplay(entry.key);
     if (localVirtualDisplay) {
       localVirtualDisplay.kill();
       if (entry.virtualDisplay === localVirtualDisplay) entry.virtualDisplay = null;
@@ -668,9 +806,10 @@ function attachBrowserCleanup(entry, candidateBrowser, localVirtualDisplay) {
   };
 }
 
-async function launchBrowserInstance(userId) {
+async function launchBrowserInstance(userId, { profileDir } = {}) {
   const entry = getBrowserEntry(userId);
-  const launchProfile = await resolveLaunchProfile(userId);
+  const profileRoot = resolveProfileRoot(profileDir);
+  const launchProfile = await resolveLaunchProfile(userId, { profileDir: profileRoot });
   const maxAttempts = proxyPool?.launchRetries ?? 1;
   let lastError = null;
 
@@ -683,15 +822,26 @@ async function launchBrowserInstance(userId) {
     let vdDisplay = undefined;
     let candidateBrowser = null;
 
+    let displayMode = null;
     try {
-      if (os.platform() === 'linux') {
-        localVirtualDisplay = pluginCtx.createVirtualDisplay();
-        vdDisplay = localVirtualDisplay.get();
+      displayMode = resolveBrowserDisplayMode({
+        platform: os.platform(),
+        userId: entry.key,
+        sharedDisplay: CONFIG.sharedDisplay,
+        sharedDisplayUserIds: CONFIG.sharedDisplayUserIds,
+        createVirtualDisplay: () => pluginCtx.createVirtualDisplay(),
+      });
+      localVirtualDisplay = displayMode.virtualDisplay;
+      vdDisplay = displayMode.display;
+      if (displayMode.usesSharedDisplay) {
+        log('info', 'using shared browser display', { display: vdDisplay, attempt });
+      } else if (localVirtualDisplay) {
         log('info', 'xvfb virtual display started', { display: vdDisplay, attempt });
       }
     } catch (err) {
       log('warn', 'xvfb not available, falling back to headless', { error: err.message, attempt });
       localVirtualDisplay = null;
+      displayMode = { display: undefined, virtualDisplay: null, usesSharedDisplay: false, headless: true };
     }
 
     const useVirtualDisplay = !!vdDisplay;
@@ -712,19 +862,30 @@ async function launchBrowserInstance(userId) {
 
     try {
       const options = await launchOptions({
-        headless: useVirtualDisplay ? false : true,
+        headless: displayMode?.headless ?? (useVirtualDisplay ? false : true),
         os: launchProfile.launchConstraints.os,
         locale: launchProfile.launchConstraints.locale,
         screen: launchProfile.launchConstraints.screen,
         window: launchProfile.launchConstraints.window,
+        webgl_config: launchProfile.launchConstraints.webglConfig,
         humanize: true,
         enable_cache: true,
+        firefox_user_prefs: launchProfile.firefoxUserPrefs,
         proxy: launchProxy,
         geoip: !!launchProxy,
         virtual_display: vdDisplay,
       });
       options.proxy = normalizePlaywrightProxy(options.proxy);
       await pluginEvents.emitAsync('browser:launching', { options });
+
+      if (displayMode?.usesSharedDisplay) {
+        options.env = {
+          ...(options.env || {}),
+          DISPLAY: vdDisplay,
+          MOZ_ENABLE_WAYLAND: '0',
+          XDG_SESSION_TYPE: 'x11',
+        };
+      }
 
       candidateBrowser = await firefox.launch(options);
 
@@ -752,9 +913,12 @@ async function launchBrowserInstance(userId) {
       }
 
       entry.virtualDisplay = localVirtualDisplay;
+      entry.display = vdDisplay || null;
       entry.launchProxy = launchProxy;
       entry.persona = launchProfile;
+      entry.profileDir = profileRoot;
       entry.browser = candidateBrowser;
+      if (vdDisplay) recordVncDisplay({ userId: entry.key, display: vdDisplay });
       attachBrowserCleanup(entry, entry.browser, localVirtualDisplay);
       pluginEvents.emit('browser:launched', { browser: entry.browser, display: vdDisplay, userId: entry.key, persona: launchProfile.persona });
 
@@ -785,9 +949,21 @@ async function launchBrowserInstance(userId) {
   throw lastError || new Error('Failed to launch a usable browser');
 }
 
-async function ensureBrowser(userId = 'default') {
+async function ensureBrowser(userId = 'default', { profileDir } = {}) {
   const entry = getBrowserEntry(userId);
+  const profileRoot = resolveProfileRoot(profileDir);
   clearBrowserIdleTimer(entry.key);
+  if (entry.browser && entry.profileDir && entry.profileDir !== profileRoot) {
+    log('warn', 'browser profile root changed, relaunching browser', { userId: entry.key, previousProfileDir: entry.profileDir, profileDir: profileRoot });
+    const existingSession = sessions.get(entry.key);
+    if (existingSession) {
+      await closeSession(entry.key, existingSession, { reason: 'profile_root_changed', clearDownloads: true, clearLocks: true });
+    }
+    await entry.browser.close().catch(() => {});
+    entry.browser = null;
+    entry.launchProxy = null;
+    entry.display = null;
+  }
   if (entry.browser && !entry.browser.isConnected()) {
     failuresTotal.labels('browser_disconnected', 'internal').inc();
     log('warn', 'browser disconnected, clearing dead sessions and relaunching', {
@@ -809,7 +985,7 @@ async function ensureBrowser(userId = 'default') {
   if (entry.launchPromise) return entry.launchPromise;
   const launchTimeoutMs = proxyPool?.launchTimeoutMs ?? 60000;
   entry.launchPromise = Promise.race([
-    launchBrowserInstance(entry.key),
+    launchBrowserInstance(entry.key, { profileDir: profileRoot }),
     new Promise((_, reject) => setTimeout(() => reject(new Error(`Browser launch timeout (${Math.round(launchTimeoutMs / 1000)}s)`)), launchTimeoutMs)),
   ]).finally(() => { entry.launchPromise = null; });
   return entry.launchPromise;
@@ -849,10 +1025,20 @@ async function closeSession(userId, session, {
     await clearSessionDownloads(session).catch(() => {});
   }
 
+  for (const [sessionKey, group] of session.tabGroups || []) {
+    for (const [tabId, tabState] of group) {
+      const url = tabState?.page?.url?.() || undefined;
+      const title = await tabState?.page?.title?.().catch(() => '') || undefined;
+      updateTabRecoveryMeta(tabState, { userId: key, sessionKey, tabId, profileDir: session.profileDir, persona: session.launchPersona?.persona, profile: session.launchPersona });
+      markTabRecoveryClosed(tabState, { reason, url, title });
+    }
+  }
+
   await pluginEvents.emitAsync('session:destroying', {
     userId: key,
     reason,
     context: session.context,
+    profileDir: session.profileDir,
   });
   await session.context.close().catch(() => {});
   sessions.delete(key);
@@ -872,8 +1058,9 @@ async function closeAllSessions(reason, { clearDownloads = true, clearLocks = tr
   }
 }
 
-async function getSession(userId) {
+async function getSession(userId, { profileDir } = {}) {
   const key = normalizeUserId(userId);
+  const profileRoot = resolveProfileRoot(profileDir);
   let session = sessions.get(key);
   
   // Check if existing session's context is still alive
@@ -893,12 +1080,18 @@ async function getSession(userId) {
     }
   }
   
+  if (session && session.profileDir && session.profileDir !== profileRoot) {
+    log('warn', 'session profile root changed, recreating context', { userId: key, previousProfileDir: session.profileDir, profileDir: profileRoot });
+    await closeSession(key, session, { reason: 'profile_root_changed', clearDownloads: true, clearLocks: true });
+    session = null;
+  }
+
   if (!session) {
-    session = await coalesceInflight(sessionCreations, key, async () => {
+    session = await coalesceInflight(sessionCreations, `${key}:${profileRoot}`, async () => {
       if (sessions.size >= MAX_SESSIONS) {
         throw new Error('Maximum concurrent sessions reached');
       }
-      const { browser: b, launchProxy: launchBrowserProxy, persona: launchPersona } = await ensureBrowser(key);
+      const { browser: b, launchProxy: launchBrowserProxy, persona: launchPersona } = await ensureBrowser(key, { profileDir: profileRoot });
       const contextOptions = {
         viewport: launchPersona?.contextDefaults?.viewport || { width: 1280, height: 720 },
         permissions: ['geolocation'],
@@ -912,6 +1105,9 @@ async function getSession(userId) {
       if (launchPersona?.contextDefaults?.geolocation) {
         contextOptions.geolocation = launchPersona.contextDefaults.geolocation;
       }
+      if (launchPersona?.contextDefaults?.deviceScaleFactor) {
+        contextOptions.deviceScaleFactor = launchPersona.contextDefaults.deviceScaleFactor;
+      }
       let sessionProxy = null;
       if (proxyPool?.canRotateSessions) {
         sessionProxy = proxyPool.getNext(`ctx-${key}-${crypto.randomUUID().replace(/-/g, '').slice(0, 8)}`);
@@ -922,18 +1118,20 @@ async function getSession(userId) {
         contextOptions.proxy = normalizePlaywrightProxy(sessionProxy);
         log('info', 'session proxy assigned', { userId: key, proxy: sessionProxy.server });
       }
-      await pluginEvents.emitAsync('session:creating', { userId: key, contextOptions });
+      await pluginEvents.emitAsync('session:creating', { userId: key, contextOptions, profileDir: profileRoot });
       const context = await b.newContext(contextOptions);
       
       const created = {
         context,
         tabGroups: new Map(),
+        profileDir: profileRoot,
+        launchPersona,
         lastAccess: Date.now(),
         proxySessionId: sessionProxy?.sessionId || null,
         browserProxySessionId: launchBrowserProxy?.sessionId || null,
       };
       sessions.set(key, created);
-      await pluginEvents.emitAsync('session:created', { userId: key, context });
+      await pluginEvents.emitAsync('session:created', { userId: key, context, profileDir: profileRoot });
       log('info', 'session created', {
         userId: key,
         proxyMode: proxyPool?.mode || null,
@@ -948,7 +1146,11 @@ async function getSession(userId) {
 }
 
 async function ensureKeepaliveTab() {
-  if (!KEEPALIVE_USER_ID) return null;
+  const selectedUserId = readSelectedVncUserId(VNC_HEALTH_INFO.displaySelection);
+  if (!shouldStartKeepalive({ keepaliveUserId: KEEPALIVE_USER_ID, selectedUserId })) {
+    log('info', 'keepalive skipped for selected managed VNC profile', { userId: KEEPALIVE_USER_ID, selectedUserId });
+    return null;
+  }
   const userId = normalizeUserId(KEEPALIVE_USER_ID);
   const session = await getSession(userId);
   const group = getTabGroup(session, KEEPALIVE_SESSION_KEY);
@@ -967,7 +1169,7 @@ async function ensureKeepaliveTab() {
 
   const page = await session.context.newPage();
   const tabId = fly.makeTabId();
-  const tabState = createTabState(page, { keepAlive: true });
+  const tabState = createTabState(page, { keepAlive: true, userId, sessionKey: KEEPALIVE_SESSION_KEY, tabId });
   attachDownloadListener(tabState, tabId, log, pluginEvents, userId);
   group.set(tabId, tabState);
   refreshActiveTabsGauge();
@@ -1090,6 +1292,7 @@ function destroyTab(session, tabId, reason, userId) {
     if (group.has(tabId)) {
       const tabState = group.get(tabId);
       log('warn', 'destroying stuck tab', { tabId, listItemId, toolCalls: tabState.toolCalls, reason: reason || 'unknown' });
+      markTabRecoveryClosed(tabState, { reason, url: tabState.page?.url?.() || undefined });
       safePageClose(tabState.page);
       group.delete(tabId);
       if (group.size === 0) session.tabGroups.delete(listItemId);
@@ -1124,6 +1327,7 @@ async function recycleOldestTab(session, reqId, userId) {
   }
   if (!oldestTab) return null;
 
+  markTabRecoveryClosed(oldestTab, { reason: 'recycled', url: oldestTab.page?.url?.() || undefined, title: await oldestTab.page?.title?.().catch(() => '') || undefined });
   await safePageClose(oldestTab.page);
   oldestGroup.delete(oldestTabId);
   if (oldestGroup.size === 0) session.tabGroups.delete(oldestGroupKey);
@@ -1156,7 +1360,12 @@ function findTab(session, tabId) {
 }
 
 function createTabState(page, options = {}) {
-  return {
+  const behaviorPersona = options.behaviorPersona || buildHumanBehaviorPersona(
+    options.humanProfileKey || [options.userId, options.sessionKey, options.tabId].filter(Boolean).join(':') || 'default',
+    { profile: options.humanProfile || 'fast' },
+  );
+
+  const tabState = {
     page,
     refs: new Map(),
     visitedUrls: new Set(),
@@ -1164,18 +1373,173 @@ function createTabState(page, options = {}) {
     toolCalls: 0,
     consecutiveTimeouts: 0,
     lastSnapshot: null,
+    lastSnapshotUrl: null,
+    lastSnapshotFull: null,
     lastRequestedUrl: null,
     googleRetryCount: 0,
     navigateAbort: null,
     keepAlive: Boolean(options.keepAlive),
+    humanSession: createHumanSessionState({
+      viewport: options.viewport || options.persona?.viewport || { width: 1280, height: 720 },
+      seed: options.humanSeed || Date.now(),
+      behaviorPersona,
+    }),
     agentHistorySteps: [],
+    recoveryMeta: {
+      userId: options.userId,
+      sessionKey: options.sessionKey,
+      tabId: options.tabId,
+      profileDir: options.profileDir,
+      siteKey: options.siteKey,
+      task_id: options.task_id || options.taskId,
+      browserPersonaKey: options.browserPersonaKey,
+      humanPersonaKey: options.humanPersonaKey,
+      humanProfile: options.humanProfile,
+      persona: options.persona,
+      profile: options.profile,
+    },
+    consoleMessages: [],
+    jsErrors: [],
+    diagnosticsTotals: { console_messages: 0, js_errors: 0 },
+    _diagnosticsPage: null,
+  };
+  attachPageDiagnostics(tabState, page);
+  return tabState;
+}
+
+async function sizeVisibleManagedPage(page, session, reqId) {
+  const viewport = session.launchPersona?.contextDefaults?.viewport || session.launchPersona?.persona?.viewport;
+  if (!viewport?.width || !viewport?.height) return null;
+  try {
+    await page.setViewportSize({ width: viewport.width, height: viewport.height });
+    await page.evaluate(({ width, height }) => {
+      try { window.moveTo(0, 0); } catch {}
+      try { window.resizeTo(width, height); } catch {}
+    }, { width: viewport.width, height: viewport.height });
+    return viewport;
+  } catch (err) {
+    log('warn', 'managed visible page resize failed', { reqId, error: err.message, viewport });
+    return null;
+  }
+}
+
+async function createServerOwnedTab(session, {
+  userId,
+  sessionKey,
+  url,
+  browserPersonaKey,
+  humanPersonaKey,
+  humanProfile,
+  profileDir,
+  siteKey,
+  task_id,
+  taskId,
+  reqId,
+  eventMetadata = {},
+}) {
+  const group = getTabGroup(session, sessionKey);
+  const page = await session.context.newPage();
+  const visibleViewport = eventMetadata.visible ? await sizeVisibleManagedPage(page, session, reqId) : null;
+  const tabId = fly.makeTabId();
+  const tabState = createTabState(page, {
+    userId,
+    sessionKey,
+    tabId,
+    profileDir: profileDir || session.profileDir,
+    siteKey,
+    task_id,
+    taskId,
+    browserPersonaKey,
+    humanPersonaKey,
+    humanProfileKey: humanPersonaKey,
+    humanProfile,
+    persona: session.launchPersona?.persona,
+    profile: session.launchPersona,
+    viewport: visibleViewport || session.launchPersona?.contextDefaults?.viewport,
+  });
+  attachDownloadListener(tabState, tabId, log, pluginEvents, userId);
+  group.set(tabId, tabState);
+  refreshActiveTabsGauge();
+
+  if (url) {
+    const urlErr = validateUrl(url);
+    if (urlErr) throw Object.assign(new Error(urlErr), { statusCode: 400 });
+    tabState.lastRequestedUrl = url;
+    await withPageLoadDuration('open_url', () => page.goto(url, { waitUntil: 'domcontentloaded', timeout: 30000 }));
+    tabState.visitedUrls.add(url);
+  }
+
+  const result = {
+    tabId,
+    targetId: tabId,
+    url: page.url(),
+    title: await page.title().catch(() => ''),
+    visibleViewport,
+  };
+  if (url) {
+    recordTabAction(tabState, { kind: 'navigate', url: result.url || url, result: { ok: true, ...result } });
+  }
+  pluginEvents.emit('tab:created', { userId, tabId, page, url: page.url(), ...eventMetadata });
+  log('info', 'tab created', { reqId, tabId, userId, sessionKey, url: page.url(), ...eventMetadata });
+  return { result, tabState };
+}
+
+function invalidateTabSnapshot(tabState) {
+  if (!tabState) return;
+  tabState.lastSnapshot = null;
+  tabState.lastSnapshotUrl = null;
+  tabState.lastSnapshotFull = null;
+}
+
+function targetContextFromRef(tabState, ref) {
+  if (!ref || !(tabState?.refs instanceof Map)) return undefined;
+  const node = tabState.refs.get(ref);
+  if (!node) return undefined;
+  return buildTargetContext({ ref, ...node });
+}
+
+function recoverySiteKeyFromUrl(url) {
+  if (!url) return null;
+  try {
+    return new URL(url).hostname;
+  } catch {
+    return null;
+  }
+}
+
+function updateTabRecoveryMeta(tabState, meta = {}) {
+  if (!tabState) return;
+  tabState.recoveryMeta = {
+    ...(tabState.recoveryMeta || {}),
+    ...Object.fromEntries(Object.entries(meta).filter(([, value]) => value !== undefined && value !== null && value !== '')),
   };
 }
 
+function buildTabRecoveryMeta(tabState, action = {}) {
+  const base = { ...(tabState?.recoveryMeta || {}) };
+  const resultUrl = action?.result?.url || action?.url || tabState?.page?.url?.();
+  if (!base.siteKey) base.siteKey = recoverySiteKeyFromUrl(resultUrl);
+  if (!base.profileDir) base.profileDir = BROWSER_PROFILE_DIR;
+  return base;
+}
+
 function recordTabAction(tabState, action) {
-  recordSuccessfulBrowserAction(tabState, action).catch((err) => {
-    log('warn', 'agent history record failed', { error: err.message, kind: action?.kind });
+  const enrichedAction = { ...action };
+  if (!enrichedAction.target_summary && enrichedAction.ref) {
+    enrichedAction.target_summary = targetContextFromRef(tabState, enrichedAction.ref);
+  }
+  const recoveryMeta = buildTabRecoveryMeta(tabState, enrichedAction);
+  recordRecoveryAction(managedRecoveryRegistry, recoveryMeta, enrichedAction);
+  updateTabRecoveryMeta(tabState, recoveryMeta);
+  recordSuccessfulBrowserAction(tabState, enrichedAction).catch((err) => {
+    log('warn', 'agent history record failed', { error: err.message, kind: enrichedAction?.kind });
   });
+}
+
+function markTabRecoveryClosed(tabState, { reason = 'closed', url, title } = {}) {
+  if (!tabState) return null;
+  const recoveryMeta = buildTabRecoveryMeta(tabState, { result: { url, title } });
+  return markRecoveryClosed(managedRecoveryRegistry, recoveryMeta, { reason, url, title });
 }
 
 async function adoptPopupIntoTab(tabState, popupPage, {
@@ -1189,7 +1553,8 @@ async function adoptPopupIntoTab(tabState, popupPage, {
   await popupPage.waitForTimeout(200).catch(() => {});
 
   tabState.page = popupPage;
-  tabState.lastSnapshot = null;
+  attachPageDiagnostics(tabState, popupPage);
+  invalidateTabSnapshot(tabState);
   tabState.refs = new Map();
   const popupUrl = popupPage.url();
   if (popupUrl) tabState.visitedUrls.add(popupUrl);
@@ -1227,7 +1592,7 @@ async function rotateGoogleTab(userId, sessionKey, tabId, previousTabState, reas
   const session = await getSession(userId);
   const group = getTabGroup(session, sessionKey);
   const page = await session.context.newPage();
-  const tabState = createTabState(page);
+  const tabState = createTabState(page, { userId, sessionKey, tabId });
   tabState.googleRetryCount = (previousTabState.googleRetryCount || 0) + 1;
   tabState.lastRequestedUrl = previousTabState.lastRequestedUrl;
   attachDownloadListener(tabState, tabId, log, pluginEvents, userId);
@@ -1332,6 +1697,13 @@ async function dismissConsentDialogs(page) {
     '#onetrust-banner-sdk button#onetrust-accept-btn-handler',
     '#onetrust-banner-sdk button#onetrust-reject-all-handler',
     '#onetrust-close-btn-container button',
+    // Leboncoin / French GDPR dialogs: prefer the non-accepting choice when available.
+    'dialog button:has-text("Continuer sans accepter")',
+    'dialog button:has-text("Refuser")',
+    'dialog button:has-text("Tout refuser")',
+    'button:has-text("Continuer sans accepter")',
+    'button:has-text("Refuser")',
+    'button:has-text("Tout refuser")',
     // Generic patterns
     'button[data-test="cookie-accept-all"]',
     'button[aria-label="Accept all"]',
@@ -1583,12 +1955,11 @@ async function buildRefs(page) {
 }
 
 async function _buildRefsInner(page, refs, start) {
-  await waitForPageReady(page, {
-    timeout: REFRESH_READY_TIMEOUT_MS,
-    waitForNetwork: false,
-    waitForHydration: false,
-    settleMs: 100,
-  });
+  if (page?.waitForLoadState) {
+    await page.waitForLoadState('domcontentloaded', { timeout: REFRESH_READY_TIMEOUT_MS }).catch((err) => {
+      log('warn', 'buildRefs domcontentloaded wait failed, continuing', { error: err.message });
+    });
+  }
   
   // Budget remaining time for ariaSnapshot
   const elapsed = Date.now() - start;
@@ -1657,12 +2028,11 @@ async function getAriaSnapshot(page) {
   if (!page || page.isClosed()) {
     return null;
   }
-  await waitForPageReady(page, {
-    timeout: REFRESH_READY_TIMEOUT_MS,
-    waitForNetwork: false,
-    waitForHydration: false,
-    settleMs: 100,
-  });
+  if (page?.waitForLoadState) {
+    await page.waitForLoadState('domcontentloaded', { timeout: REFRESH_READY_TIMEOUT_MS }).catch((err) => {
+      log('warn', 'ariaSnapshot domcontentloaded wait failed, continuing', { error: err.message });
+    });
+  }
   try {
     return await page.locator('body').ariaSnapshot({ timeout: 5000 });
   } catch (err) {
@@ -1671,21 +2041,58 @@ async function getAriaSnapshot(page) {
   }
 }
 
+function annotateAriaSnapshot(ariaYaml, refs) {
+  let annotatedYaml = ariaYaml || '';
+  if (annotatedYaml && refs.size > 0) {
+    const refsByKey = new Map();
+    for (const [refId, info] of refs) {
+      const key = `${info.role}:${info.name}:${info.nth}`;
+      refsByKey.set(key, refId);
+    }
+
+    const annotationCounts = new Map();
+    const lines = annotatedYaml.split('\n');
+
+    annotatedYaml = lines.map(line => {
+      const match = line.match(/^(\s*-\s+)(\w+)(\s+"([^"]*)")?(.*)$/);
+      if (match) {
+        const [, prefix, role, nameMatch, name, suffix] = match;
+        const normalizedRole = role.toLowerCase();
+        if (normalizedRole === 'combobox') return line;
+        if (name && SKIP_PATTERNS.some(p => p.test(name))) return line;
+        if (INTERACTIVE_ROLES.includes(normalizedRole)) {
+          const normalizedName = name || '';
+          const countKey = `${normalizedRole}:${normalizedName}`;
+          const nth = annotationCounts.get(countKey) || 0;
+          annotationCounts.set(countKey, nth + 1);
+          const key = `${normalizedRole}:${normalizedName}:${nth}`;
+          const refId = refsByKey.get(key);
+          if (refId) {
+            return `${prefix}${role}${nameMatch || ''} [${refId}]${suffix}`;
+          }
+        }
+      }
+      return line;
+    }).join('\n');
+  }
+  return annotatedYaml;
+}
+
 function refToLocator(page, ref, refs) {
   const info = refs.get(ref);
   if (!info) return null;
-  
+
   const { role, name, nth, selector } = info;
   if (selector) {
     return page.locator(selector).first();
   }
 
-  let locator = page.getByRole(role, name ? { name } : undefined);
-  
+  let locator = page.getByRole(role, name ? { name, exact: true } : undefined);
+
   // Always use .nth() to disambiguate duplicate role+name combinations
   // This avoids "strict mode violation" when multiple elements match
   locator = locator.nth(nth);
-  
+
   return locator;
 }
 
@@ -1765,9 +2172,137 @@ app.get('/metrics', async (_req, res) => {
 });
 
 // Create new tab
+app.post('/managed/visible-tab', async (req, res) => {
+  try {
+    const { userId, sessionKey, url, profileDir, display, browserPersonaKey, humanPersonaKey, humanProfile, siteKey, task_id, taskId } = req.body;
+    if (!userId || !sessionKey) {
+      return res.status(400).json({ error: 'userId and sessionKey required' });
+    }
+    if (!url) {
+      return res.status(400).json({ error: 'url required' });
+    }
+    const urlErr = validateUrl(url);
+    if (urlErr) return res.status(400).json({ error: urlErr });
+    if (display) requireSharedDisplayForUser(userId, display);
+
+    const result = await withTimeout((async () => {
+      const session = await getSession(userId, { profileDir });
+      let totalTabs = 0;
+      for (const group of session.tabGroups.values()) totalTabs += group.size;
+      if (totalTabs >= MAX_TABS_PER_SESSION || getTotalTabCount() >= MAX_TABS_GLOBAL) {
+        const recycled = await recycleOldestTab(session, req.reqId, userId);
+        if (!recycled) {
+          throw Object.assign(new Error('Maximum tabs per session reached'), { statusCode: 429 });
+        }
+      }
+
+      const { result: tabResult } = await createServerOwnedTab(session, {
+        userId,
+        sessionKey,
+        url,
+        browserPersonaKey,
+        humanPersonaKey,
+        humanProfile,
+        profileDir,
+        siteKey,
+        task_id,
+        taskId,
+        reqId: req.reqId,
+        eventMetadata: { visible: true, display: display || null },
+      });
+      return { ok: true, ...tabResult, userId, sessionKey, visible: true, display: display || null };
+    })(), requestTimeoutMs(), 'managed visible tab create');
+
+    res.json(result);
+  } catch (err) {
+    log('error', 'managed visible tab create failed', { reqId: req.reqId, error: err.message });
+    handleRouteError(err, req, res);
+  }
+});
+
+app.post('/managed/recover-tab', async (req, res) => {
+  try {
+    const { userId, sessionKey, profileDir, siteKey, tabId, fallbackUrl, browserPersonaKey, humanPersonaKey, humanProfile, task_id, taskId } = req.body;
+    if (!userId) return res.status(400).json({ error: 'userId required' });
+    const resolvedSessionKey = sessionKey || 'default';
+    const key = normalizeUserId(userId);
+    const meta = { userId, sessionKey: resolvedSessionKey, profileDir, siteKey, tabId, task_id: task_id || taskId };
+    const session = sessions.get(key);
+    const found = session && tabId ? findTab(session, tabId) : null;
+    if (found?.tabState?.page && !found.tabState.page.isClosed()) {
+      updateTabRecoveryMeta(found.tabState, { ...meta, sessionKey: found.listItemId, profileDir: profileDir || session.profileDir });
+      const url = found.tabState.page.url();
+      const title = await found.tabState.page.title().catch(() => '');
+      recordRecoveryAction(managedRecoveryRegistry, buildTabRecoveryMeta(found.tabState, { result: { url, title } }), { kind: 'recover', result: { ok: true, url, title, recovered: false } });
+      return res.json({ ok: true, recovered: false, previousTabId: tabId || null, tabId, url, title });
+    }
+
+    const state = getRecoveryState(managedRecoveryRegistry, meta);
+    const previousTabId = tabId || state?.lastTabId || null;
+    const targetUrl = getRecoveryTargetUrl(state, fallbackUrl);
+    if (!targetUrl) {
+      return res.status(404).json({
+        error: 'No recovery target URL available',
+        recovered: false,
+        previousTabId,
+      });
+    }
+    const activeSession = await getSession(userId, { profileDir });
+    const { result, tabState } = await createServerOwnedTab(activeSession, {
+      userId,
+      sessionKey: resolvedSessionKey,
+      url: targetUrl,
+      browserPersonaKey,
+      humanPersonaKey,
+      humanProfile,
+      profileDir,
+      siteKey,
+      task_id,
+      taskId,
+      reqId: req.reqId,
+      eventMetadata: { recovered: true, previousTabId },
+    });
+    updateTabRecoveryMeta(tabState, { ...meta, tabId: result.tabId, profileDir: profileDir || activeSession.profileDir });
+    tabState.refs = await buildRefs(tabState.page);
+    const ariaYaml = await getAriaSnapshot(tabState.page);
+    const annotatedYaml = compactSnapshot(annotateAriaSnapshot(ariaYaml, tabState.refs));
+    tabState.lastSnapshot = annotatedYaml;
+    tabState.lastSnapshotFull = false;
+    tabState.lastSnapshotUrl = tabState.page.url();
+    recordTabAction(tabState, { kind: 'recover', url: result.url || targetUrl, result: { ok: true, ...result, recovered: true, previousTabId } });
+    res.json({ ok: true, recovered: true, previousTabId, tabId: result.tabId, url: result.url, title: result.title, snapshot: annotatedYaml, refsCount: tabState.refs.size });
+  } catch (err) {
+    log('error', 'managed tab recovery failed', { reqId: req.reqId, error: err.message });
+    handleRouteError(err, req, res);
+  }
+});
+
+app.post('/managed/storage-checkpoint', async (req, res) => {
+  try {
+    const { userId, profileDir, reason } = req.body;
+    if (!userId) return res.status(400).json({ error: 'userId required' });
+    const key = normalizeUserId(userId);
+    const session = sessions.get(key);
+    if (!session) {
+      return res.status(404).json({ error: `No active managed browser session for ${key}` });
+    }
+    const effectiveProfileDir = profileDir || session.profileDir;
+    await pluginEvents.emitAsync('session:storage:checkpoint', {
+      userId: key,
+      profileDir: effectiveProfileDir,
+      reason: reason || 'manual_checkpoint',
+    });
+    res.json({ ok: true, userId: key, profileDir: effectiveProfileDir, reason: reason || 'manual_checkpoint', persisted: true });
+  } catch (err) {
+    log('error', 'managed storage checkpoint failed', { reqId: req.reqId, error: err.message });
+    handleRouteError(err, req, res);
+  }
+});
+
 app.post('/tabs', async (req, res) => {
   try {
-    const { userId, sessionKey, listItemId, url } = req.body;
+    const { userId, sessionKey, listItemId, url, profileDir, browserPersonaKey, humanPersonaKey, humanProfile, siteKey, task_id, taskId } = req.body;
+    assertRawTabCreateAllowed(req.body);
     // Accept both sessionKey (preferred) and listItemId (legacy) for backward compatibility
     const resolvedSessionKey = sessionKey || listItemId;
     if (!userId || !resolvedSessionKey) {
@@ -1775,7 +2310,7 @@ app.post('/tabs', async (req, res) => {
     }
     
     const result = await withTimeout((async () => {
-      const session = await getSession(userId);
+      const session = await getSession(userId, { profileDir });
       
       let totalTabs = 0;
       for (const group of session.tabGroups.values()) totalTabs += group.size;
@@ -1788,26 +2323,20 @@ app.post('/tabs', async (req, res) => {
         }
       }
       
-      const group = getTabGroup(session, resolvedSessionKey);
-      
-      const page = await session.context.newPage();
-      const tabId = fly.makeTabId();
-      const tabState = createTabState(page);
-      attachDownloadListener(tabState, tabId, log, pluginEvents, userId);
-      group.set(tabId, tabState);
-      refreshActiveTabsGauge();
-      
-      if (url) {
-        const urlErr = validateUrl(url);
-        if (urlErr) throw Object.assign(new Error(urlErr), { statusCode: 400 });
-        tabState.lastRequestedUrl = url;
-        await withPageLoadDuration('open_url', () => page.goto(url, { waitUntil: 'domcontentloaded', timeout: 30000 }));
-        tabState.visitedUrls.add(url);
-      }
-      
-      pluginEvents.emit('tab:created', { userId, tabId, page, url: page.url() });
-      log('info', 'tab created', { reqId: req.reqId, tabId, userId, sessionKey: resolvedSessionKey, url: page.url() });
-      return { tabId, url: page.url() };
+      const { result } = await createServerOwnedTab(session, {
+        userId,
+        sessionKey: resolvedSessionKey,
+        url,
+        browserPersonaKey,
+        humanPersonaKey,
+        humanProfile,
+        profileDir,
+        siteKey,
+        task_id,
+        taskId,
+        reqId: req.reqId,
+      });
+      return { tabId: result.tabId, url: result.url };
     })(), requestTimeoutMs(), 'tab create');
 
     res.json(result);
@@ -1822,18 +2351,18 @@ app.post('/tabs/:tabId/navigate', async (req, res) => {
   const tabId = req.params.tabId;
   
   try {
-    const { userId, url, macro, query, sessionKey, listItemId } = req.body;
+    const { userId, url, macro, query, sessionKey, listItemId, profileDir, browserPersonaKey, humanPersonaKey, humanProfile, siteKey, task_id, taskId } = req.body;
     if (!userId) return res.status(400).json({ error: 'userId required' });
 
     const result = await withUserLimit(userId, () => withTimeout((async () => {
-      await ensureBrowser(userId);
+      await ensureBrowser(userId, { profileDir });
       const resolvedSessionKey = sessionKey || listItemId || 'default';
       let session = sessions.get(normalizeUserId(userId));
       let found = session && findTab(session, tabId);
       
       let tabState;
       if (!found) {
-        session = await getSession(userId);
+        session = await getSession(userId, { profileDir });
         let sessionTabs = 0;
         for (const g of session.tabGroups.values()) sessionTabs += g.size;
         if (getTotalTabCount() >= MAX_TABS_GLOBAL || sessionTabs >= MAX_TABS_PER_SESSION) {
@@ -1845,7 +2374,21 @@ app.post('/tabs/:tabId/navigate', async (req, res) => {
         }
         {
           const page = await session.context.newPage();
-          tabState = createTabState(page);
+          tabState = createTabState(page, {
+            userId: browserPersonaKey || userId,
+            sessionKey: resolvedSessionKey,
+            tabId,
+            profileDir: profileDir || session.profileDir,
+            siteKey,
+            task_id,
+            taskId,
+            browserPersonaKey,
+            humanPersonaKey,
+            humanProfileKey: humanPersonaKey,
+            humanProfile,
+            persona: session.launchPersona?.persona,
+            profile: session.launchPersona,
+          });
           attachDownloadListener(tabState, tabId, log, pluginEvents, userId);
           const group = getTabGroup(session, resolvedSessionKey);
           group.set(tabId, tabState);
@@ -1881,7 +2424,7 @@ app.post('/tabs/:tabId/navigate', async (req, res) => {
               new Promise((_, reject) => ac.signal.addEventListener('abort', () => reject(new Error('Navigation aborted: tab deleted')), { once: true })),
             ]);
             tabState.visitedUrls.add(targetUrl);
-            tabState.lastSnapshot = null;
+            invalidateTabSnapshot(tabState);
           } catch (err) {
             gotoP.catch(() => {}); // suppress unhandled rejection from still-pending goto
             throw err;
@@ -1907,10 +2450,24 @@ app.post('/tabs/:tabId/navigate', async (req, res) => {
           if (oldSession) {
             await closeSession(key, oldSession, { reason: 'google_blocked_context_rotate', clearDownloads: true, clearLocks: true });
           }
-          session = await getSession(userId);
+          session = await getSession(userId, { profileDir });
           const group = getTabGroup(session, currentSessionKey);
           const page = await session.context.newPage();
-          tabState = createTabState(page);
+          tabState = createTabState(page, {
+            userId,
+            sessionKey: currentSessionKey,
+            tabId,
+            profileDir: profileDir || session.profileDir,
+            siteKey,
+            task_id,
+            taskId,
+            browserPersonaKey,
+            humanPersonaKey,
+            humanProfileKey: humanPersonaKey,
+            humanProfile,
+            persona: session.launchPersona?.persona,
+            profile: session.launchPersona,
+          });
           tabState.googleRetryCount = previousRetryCount + 1;
           attachDownloadListener(tabState, tabId, log, pluginEvents, userId);
           group.set(tabId, tabState);
@@ -1955,7 +2512,10 @@ app.post('/tabs/:tabId/navigate', async (req, res) => {
     {
       const session = sessions.get(normalizeUserId(req.body.userId));
       const found = session && findTab(session, tabId);
-      if (found?.tabState) recordTabAction(found.tabState, { kind: 'navigate', url: result.url || req.body.url, result });
+      if (found?.tabState) {
+        updateTabRecoveryMeta(found.tabState, { userId: req.body.userId, sessionKey: found.listItemId, tabId, profileDir: session.profileDir, siteKey: req.body.siteKey, task_id: req.body.task_id || req.body.taskId });
+        recordTabAction(found.tabState, { kind: 'navigate', url: result.url || req.body.url, result });
+      }
     }
     log('info', 'navigated', { reqId: req.reqId, tabId, url: result.url });
     pluginEvents.emit('tab:navigated', { userId: req.body.userId, tabId, url: result.url, prevUrl: null });
@@ -1975,6 +2535,13 @@ app.get('/tabs/:tabId/snapshot', async (req, res) => {
   try {
     const userId = req.query.userId;
     if (!userId) return res.status(400).json({ error: 'userId required' });
+    const recoveryHints = {
+      userId,
+      sessionKey: req.query.sessionKey || req.query.listItemId,
+      profileDir: req.query.profileDir,
+      siteKey: req.query.siteKey,
+      task_id: req.query.task_id || req.query.taskId,
+    };
     const format = req.query.format || 'text';
     const offset = parseInt(req.query.offset) || 0;
     const session = sessions.get(normalizeUserId(userId));
@@ -1982,16 +2549,30 @@ app.get('/tabs/:tabId/snapshot', async (req, res) => {
     if (!found) return res.status(404).json({ error: 'Tab not found' });
     
     const { tabState } = found;
+    updateTabRecoveryMeta(tabState, { ...recoveryHints, sessionKey: recoveryHints.sessionKey || found.listItemId, tabId: req.params.tabId, profileDir: recoveryHints.profileDir || session.profileDir });
     tabState.toolCalls++; tabState.consecutiveTimeouts = 0;
 
+    const includeScreenshot = req.query.includeScreenshot === 'true';
+    const full = req.query.full === 'true';
+    const currentUrl = tabState.page.url();
+
+    if (!includeScreenshot && offset === 0 && tabState.lastSnapshot && tabState.lastSnapshotUrl === currentUrl && tabState.lastSnapshotFull === full) {
+      const win = windowSnapshot(tabState.lastSnapshot, 0);
+      const response = { url: currentUrl, snapshot: win.text, refsCount: tabState.refs.size, truncated: win.truncated, totalChars: win.totalChars, hasMore: win.hasMore, nextOffset: win.nextOffset };
+      recordTabAction(tabState, { kind: 'snapshot', full, includeScreenshot, offset, result: { ok: true, ...response, title: await tabState.page.title().catch(() => '') } });
+      log('info', 'snapshot (cached)', { reqId: req.reqId, tabId: req.params.tabId, totalChars: win.totalChars });
+      return res.json(response);
+    }
+
     // Cached chunk retrieval for offset>0 requests
-    if (offset > 0 && tabState.lastSnapshot) {
+    if (offset > 0 && tabState.lastSnapshot && tabState.lastSnapshotFull === full) {
       const win = windowSnapshot(tabState.lastSnapshot, offset);
-      const response = { url: tabState.page.url(), snapshot: win.text, refsCount: tabState.refs.size, truncated: win.truncated, totalChars: win.totalChars, hasMore: win.hasMore, nextOffset: win.nextOffset };
-      if (req.query.includeScreenshot === 'true') {
+      const response = { url: currentUrl, snapshot: win.text, refsCount: tabState.refs.size, truncated: win.truncated, totalChars: win.totalChars, hasMore: win.hasMore, nextOffset: win.nextOffset };
+      if (includeScreenshot) {
         const pngBuffer = await tabState.page.screenshot({ type: 'png' });
         response.screenshot = { data: pngBuffer.toString('base64'), mimeType: 'image/png' };
       }
+      recordTabAction(tabState, { kind: 'snapshot', full, includeScreenshot, offset, result: { ok: true, ...response, title: await tabState.page.title().catch(() => '') } });
       log('info', 'snapshot (cached offset)', { reqId: req.reqId, tabId: req.params.tabId, offset, totalChars: win.totalChars });
       return res.json(response);
     }
@@ -2010,7 +2591,9 @@ app.get('/tabs/:tabId/snapshot', async (req, res) => {
             tabState.toolCalls = rotated.tabState.toolCalls;
             tabState.consecutiveTimeouts = rotated.tabState.consecutiveTimeouts;
             tabState.lastSnapshot = rotated.tabState.lastSnapshot;
+            tabState.lastSnapshotFull = rotated.tabState.lastSnapshotFull;
             tabState.lastRequestedUrl = rotated.tabState.lastRequestedUrl;
+            attachPageDiagnostics(tabState, tabState.page);
             tabState.googleRetryCount = rotated.tabState.googleRetryCount;
           }
         }
@@ -2022,10 +2605,12 @@ app.get('/tabs/:tabId/snapshot', async (req, res) => {
       if (isGoogleSerp(pageUrl)) {
         const { refs: googleRefs, snapshot: googleSnapshot } = await extractGoogleSerp(tabState.page);
         tabState.refs = googleRefs;
-        tabState.lastSnapshot = googleSnapshot;
-        snapshotBytes.labels('google_serp').observe(Buffer.byteLength(googleSnapshot, 'utf8'));
-        const annotatedYaml = googleSnapshot;
-        const win = windowSnapshot(annotatedYaml, 0);
+        tabState.lastSnapshotUrl = pageUrl;
+        const annotatedYaml = full ? googleSnapshot : compactSnapshot(googleSnapshot);
+        tabState.lastSnapshot = annotatedYaml;
+        tabState.lastSnapshotFull = full;
+        snapshotBytes.labels('google_serp').observe(Buffer.byteLength(annotatedYaml, 'utf8'));
+        const win = windowSnapshot(annotatedYaml, offset);
         const response = {
           url: pageUrl,
           snapshot: win.text,
@@ -2035,7 +2620,7 @@ app.get('/tabs/:tabId/snapshot', async (req, res) => {
           hasMore: win.hasMore,
           nextOffset: win.nextOffset,
         };
-        if (req.query.includeScreenshot === 'true') {
+        if (includeScreenshot) {
           const pngBuffer = await tabState.page.screenshot({ type: 'png' });
           response.screenshot = { data: pngBuffer.toString('base64'), mimeType: 'image/png' };
         }
@@ -2045,43 +2630,14 @@ app.get('/tabs/:tabId/snapshot', async (req, res) => {
       tabState.refs = await refreshTabRefs(tabState, { reason: 'snapshot' });
       const ariaYaml = await getAriaSnapshot(tabState.page);
       
-      let annotatedYaml = ariaYaml || '';
-      if (annotatedYaml && tabState.refs.size > 0) {
-        const refsByKey = new Map();
-        for (const [refId, info] of tabState.refs) {
-          const key = `${info.role}:${info.name}:${info.nth}`;
-          refsByKey.set(key, refId);
-        }
-        
-        const annotationCounts = new Map();
-        const lines = annotatedYaml.split('\n');
-        
-        annotatedYaml = lines.map(line => {
-          const match = line.match(/^(\s*-\s+)(\w+)(\s+"([^"]*)")?(.*)$/);
-          if (match) {
-            const [, prefix, role, nameMatch, name, suffix] = match;
-            const normalizedRole = role.toLowerCase();
-            if (normalizedRole === 'combobox') return line;
-            if (name && SKIP_PATTERNS.some(p => p.test(name))) return line;
-            if (INTERACTIVE_ROLES.includes(normalizedRole)) {
-              const normalizedName = name || '';
-              const countKey = `${normalizedRole}:${normalizedName}`;
-              const nth = annotationCounts.get(countKey) || 0;
-              annotationCounts.set(countKey, nth + 1);
-              const key = `${normalizedRole}:${normalizedName}:${nth}`;
-              const refId = refsByKey.get(key);
-              if (refId) {
-                return `${prefix}${role}${nameMatch || ''} [${refId}]${suffix}`;
-              }
-            }
-          }
-          return line;
-        }).join('\n');
-      }
-      
+      let annotatedYaml = annotateAriaSnapshot(ariaYaml, tabState.refs);
+      if (!full) annotatedYaml = compactSnapshot(annotatedYaml);
+
       tabState.lastSnapshot = annotatedYaml;
-      if (annotatedYaml) snapshotBytes.labels('full').observe(Buffer.byteLength(annotatedYaml, 'utf8'));
-      const win = windowSnapshot(annotatedYaml, 0);
+      tabState.lastSnapshotFull = full;
+      tabState.lastSnapshotUrl = tabState.page.url();
+      if (annotatedYaml) snapshotBytes.labels(full ? 'full' : 'compact').observe(Buffer.byteLength(annotatedYaml, 'utf8'));
+      const win = windowSnapshot(annotatedYaml, offset);
 
       const response = {
         url: tabState.page.url(),
@@ -2093,7 +2649,7 @@ app.get('/tabs/:tabId/snapshot', async (req, res) => {
         nextOffset: win.nextOffset,
       };
 
-      if (req.query.includeScreenshot === 'true') {
+      if (includeScreenshot) {
         const pngBuffer = await tabState.page.screenshot({ type: 'png' });
         response.screenshot = { data: pngBuffer.toString('base64'), mimeType: 'image/png' };
       }
@@ -2101,6 +2657,7 @@ app.get('/tabs/:tabId/snapshot', async (req, res) => {
       return response;
     })(), requestTimeoutMs(), 'snapshot'));
 
+    recordTabAction(tabState, { kind: 'snapshot', full, includeScreenshot, offset, result: { ok: true, ...result, title: await tabState.page.title().catch(() => '') } });
     pluginEvents.emit('tab:snapshot', { userId: req.query.userId, tabId: req.params.tabId, snapshot: result.snapshot });
     log('info', 'snapshot', { reqId: req.reqId, tabId: req.params.tabId, url: result.url, snapshotLen: result.snapshot?.length, refsCount: result.refsCount, hasScreenshot: !!result.screenshot, truncated: result.truncated });
     res.json(result);
@@ -2119,9 +2676,13 @@ app.post('/tabs/:tabId/wait', async (req, res) => {
     if (!found) return res.status(404).json({ error: 'Tab not found' });
     
     const { tabState } = found;
+    updateTabRecoveryMeta(tabState, { userId, sessionKey: found.listItemId, tabId: req.params.tabId, profileDir: session.profileDir, task_id: req.body.task_id || req.body.taskId, siteKey: req.body.siteKey });
+    tabState.toolCalls++; tabState.consecutiveTimeouts = 0;
     const ready = await waitForPageReady(tabState.page, { timeout, waitForNetwork });
+    const result = { ok: true, ready, url: tabState.page.url(), title: await tabState.page.title().catch(() => '') };
+    recordTabAction(tabState, { kind: 'wait', timeout, waitForNetwork, result });
     
-    res.json({ ok: true, ready });
+    res.json(result);
   } catch (err) {
     log('error', 'wait failed', { reqId: req.reqId, error: err.message });
     handleRouteError(err, req, res);
@@ -2133,111 +2694,103 @@ app.post('/tabs/:tabId/click', async (req, res) => {
   const tabId = req.params.tabId;
   
   try {
-    const { userId, ref, selector } = req.body;
+    const { userId, ref, selector, humanProfile = 'fast' } = req.body;
     if (!userId) return res.status(400).json({ error: 'userId required' });
     const session = sessions.get(normalizeUserId(userId));
     const found = session && findTab(session, tabId);
     if (!found) return res.status(404).json({ error: 'Tab not found' });
     
     const { tabState } = found;
+    updateTabRecoveryMeta(tabState, { userId, sessionKey: found.listItemId, tabId, profileDir: session.profileDir, task_id: req.body.task_id || req.body.taskId, siteKey: req.body.siteKey });
     tabState.toolCalls++; tabState.consecutiveTimeouts = 0;
     
     if (!ref && !selector) {
       return res.status(400).json({ error: 'ref or selector required' });
     }
     
+    let targetSummary = targetContextFromRef(tabState, ref);
     const result = await withUserLimit(userId, () => withTabLock(tabId, async () => {
       const clickStart = Date.now();
-      const remainingBudget = () => Math.max(0, HANDLER_TIMEOUT_MS - 2000 - (Date.now() - clickStart));
-      // Full mouse event sequence for stubborn JS click handlers (mirrors Swift WebView.swift)
-      // Dispatches: mouseover → mouseenter → mousedown → mouseup → click
-      const dispatchMouseSequence = async (locator) => {
-        const box = await locator.boundingBox();
-        if (!box) throw new Error('Element not visible (no bounding box)');
-        
-        const x = box.x + box.width / 2;
-        const y = box.y + box.height / 2;
-        
-        // Move mouse to element (triggers mouseover/mouseenter)
-        await tabState.page.mouse.move(x, y);
-        await tabState.page.waitForTimeout(50);
-        
-        // Full click sequence
-        await tabState.page.mouse.down();
-        await tabState.page.waitForTimeout(50);
-        await tabState.page.mouse.up();
-        
-        log('info', 'mouse sequence dispatched', { x: x.toFixed(0), y: y.toFixed(0) });
-      };
-      
-      // On Google SERPs, skip the normal click attempt (always intercepted by overlays)
-      // and go directly to force click — saves 5s timeout per click
+      const clickDeadlineAt = clickStart + HANDLER_TIMEOUT_MS - 2500;
+      const remainingBudget = () => Math.max(0, clickDeadlineAt - Date.now());
+      const clickPhaseLog = (phase, extra = {}) => log('info', `click phase ${phase}`, { reqId: req.reqId, tabId, elapsed: Date.now() - clickStart, budget: remainingBudget(), ...extra });
       const onGoogleSerp = isGoogleSerp(tabState.page.url());
-      
-      const doClick = async (locatorOrSelector, isLocator) => {
-        const locator = isLocator ? locatorOrSelector : tabState.page.locator(locatorOrSelector);
-        
-        if (onGoogleSerp) {
-          try {
-            await locator.click({ timeout: 3000, force: true });
-          } catch (forceErr) {
-            log('warn', 'google force click failed, trying mouse sequence');
-            await dispatchMouseSequence(locator);
-          }
-          return;
-        }
-        
-        try {
-          // First try normal click (respects visibility, enabled, not-obscured)
-          await locator.click({ timeout: 3000 });
-        } catch (err) {
-          // Fallback 1: If intercepted by overlay, retry with force
-          if (err.message.includes('intercepts pointer events')) {
-            log('warn', 'click intercepted, retrying with force');
-            try {
-              await locator.click({ timeout: 3000, force: true });
-            } catch (forceErr) {
-              // Fallback 2: Full mouse event sequence for stubborn JS handlers
-              log('warn', 'force click failed, trying mouse sequence');
-              await dispatchMouseSequence(locator);
-            }
-          } else if (err.message.includes('not visible') || err.message.toLowerCase().includes('timeout')) {
-            // Fallback 2: Element not responding to click, try mouse sequence
-            log('warn', 'click timeout, trying mouse sequence');
-            await dispatchMouseSequence(locator);
-          } else {
-            throw err;
-          }
-        }
-      };
-      
       const sourcePage = tabState.page;
       const popupPromise = sourcePage.waitForEvent('popup', { timeout: 1500 }).catch(() => null);
 
-      if (ref) {
-        let locator = refToLocator(tabState.page, ref, tabState.refs);
-        if (!locator) {
-          // Use tight timeout (4s max) to leave budget for click + post-click buildRefs
-          log('info', 'auto-refreshing refs before click', { ref, hadRefs: tabState.refs.size });
-          try {
-            const preClickBudget = Math.min(4000, remainingBudget());
-            tabState.refs = await refreshTabRefs(tabState, { reason: 'pre_click', timeoutMs: preClickBudget });
-          } catch (e) {
-            if (e.message === 'pre_click_refs_timeout' || e.message === 'buildRefs_timeout') {
-              log('warn', 'pre-click buildRefs timed out, proceeding without refresh');
-            } else {
-              throw e;
+      const resolveLocator = async () => {
+        if (ref) {
+          let locator = refToLocator(tabState.page, ref, tabState.refs);
+          if (!locator) {
+            log('info', 'auto-refreshing refs before click', { ref, hadRefs: tabState.refs.size });
+            try {
+              const preClickBudget = Math.min(4000, remainingBudget());
+              tabState.refs = await refreshTabRefs(tabState, { reason: 'pre_click', timeoutMs: preClickBudget });
+            } catch (e) {
+              if (e.message === 'pre_click_refs_timeout' || e.message === 'buildRefs_timeout') {
+                log('warn', 'pre-click buildRefs timed out, proceeding without refresh');
+              } else {
+                throw e;
+              }
             }
+            locator = refToLocator(tabState.page, ref, tabState.refs);
           }
-          locator = refToLocator(tabState.page, ref, tabState.refs);
+          if (!locator) {
+            const maxRef = tabState.refs.size > 0 ? `e${tabState.refs.size}` : 'none';
+            throw new StaleRefsError(ref, maxRef, tabState.refs.size);
+          }
+          targetSummary = targetSummary || targetContextFromRef(tabState, ref);
+          return locator;
         }
-        if (!locator) {
-          const maxRef = tabState.refs.size > 0 ? `e${tabState.refs.size}` : 'none';
-          throw new StaleRefsError(ref, maxRef, tabState.refs.size);
-        }
-        await doClick(locator, true);
+        return tabState.page.locator(selector);
+      };
+
+      const locator = await resolveLocator();
+      clickPhaseLog('locator_resolved', { onGoogleSerp });
+      if (onGoogleSerp) {
+        await locator.click({ timeout: 3000, force: true });
       } else {
-        await doClick(selector, false);
+        clickPhaseLog('prepare_start');
+        try {
+          await withActionTimeout(
+            humanPrepareTarget(tabState.page, locator, {
+              profile: humanProfile,
+              viewport: tabState.humanSession?.viewport,
+              behaviorPersona: tabState.humanSession?.behaviorPersona,
+              timeout: Math.min(1000, remainingBudget()),
+              boxTimeout: 500,
+              scrollTimeout: 1000,
+              allowBoundingBoxFallback: true,
+              preferBoundingBox: true,
+              skipReadingPause: true,
+            }),
+            Math.min(1500, remainingBudget()),
+            'click prepare timed out'
+          );
+          clickPhaseLog('prepare_done');
+        } catch (err) {
+          clickPhaseLog('prepare_skipped', { error: err.message });
+        }
+        clickPhaseLog('human_click_start', { cursor: getHumanCursor(tabState.humanSession) });
+        const clickResult = await withActionTimeout(
+          humanClick(tabState.page, locator, {
+            profile: humanProfile,
+            from: getHumanCursor(tabState.humanSession),
+            viewport: tabState.humanSession?.viewport,
+            timeout: Math.min(5000, remainingBudget()),
+            moveTimeout: 150,
+            mouseTimeout: 700,
+            allowBoundingBoxFallback: true,
+            preferBoundingBox: true,
+            allowLocatorClickFallback: true,
+            allowKeyboardActivateFallback: true,
+            deadlineAt: clickDeadlineAt,
+          }),
+          Math.min(8000, remainingBudget()),
+          'human click timed out'
+        );
+        clickPhaseLog('human_click_done', { position: clickResult.position });
+        updateHumanCursor(tabState.humanSession, clickResult.cursor || clickResult.position);
       }
 
       const popupPage = await Promise.race([
@@ -2255,25 +2808,18 @@ app.post('/tabs/:tabId/click', async (req, res) => {
         };
       }
       
-      // If clicking on a Google SERP, wait for potential navigation to complete
       if (onGoogleSerp) {
         try {
           await tabState.page.waitForLoadState('domcontentloaded', { timeout: 3000 });
         } catch {}
         await tabState.page.waitForTimeout(200);
-        // Skip buildRefs here — SERP clicks typically navigate to a new page,
-        // and the caller always requests /snapshot next which rebuilds refs.
-        tabState.lastSnapshot = null;
+        invalidateTabSnapshot(tabState);
         tabState.refs = new Map();
         const newUrl = tabState.page.url();
         tabState.visitedUrls.add(newUrl);
         return { ok: true, url: newUrl, refsAvailable: false };
-      } else {
-        await tabState.page.waitForTimeout(500);
       }
-      tabState.lastSnapshot = null;
-      // buildRefs after click — use remaining budget (min 2s) so we don't blow the handler timeout.
-      // If it times out, return without refs (caller's next /snapshot will rebuild them).
+      invalidateTabSnapshot(tabState);
       const postClickBudget = Math.max(2000, remainingBudget());
       try {
         tabState.refs = await refreshTabRefs(tabState, { reason: 'post_click', timeoutMs: postClickBudget });
@@ -2291,7 +2837,7 @@ app.post('/tabs/:tabId/click', async (req, res) => {
       return { ok: true, url: newUrl, refsAvailable: tabState.refs.size > 0 };
     }));
     
-    recordTabAction(tabState, { kind: 'click', ref: req.body.ref, selector: req.body.selector, result });
+    recordTabAction(tabState, { kind: 'click', ref: req.body.ref, selector: req.body.selector, target_summary: targetSummary, result });
     log('info', 'clicked', { reqId: req.reqId, tabId, url: result.url });
     pluginEvents.emit('tab:click', { userId: req.body.userId, tabId, ref: req.body.ref, selector: req.body.selector });
     res.json(result);
@@ -2303,7 +2849,7 @@ app.post('/tabs/:tabId/click', async (req, res) => {
         const found = session && findTab(session, tabId);
         if (found?.tabState?.page && !found.tabState.page.isClosed()) {
           found.tabState.refs = await refreshTabRefs(found.tabState, { reason: 'click_timeout' });
-          found.tabState.lastSnapshot = null;
+          invalidateTabSnapshot(found.tabState);
           return res.status(500).json({
             error: safeError(err),
             hint: 'The page may have changed. Call snapshot to see the current state and retry.',
@@ -2324,12 +2870,13 @@ app.post('/tabs/:tabId/type', async (req, res) => {
   const tabId = req.params.tabId;
   
   try {
-    const { userId, ref, selector, text, mode = 'fill', delay = 30, submit = false, pressEnter = false } = req.body;
+    const { userId, ref, selector, text, mode = 'fill', delay = 30, submit = false, pressEnter = false, humanProfile = 'fast', clearFirst = true } = req.body;
     const session = sessions.get(normalizeUserId(userId));
     const found = session && findTab(session, tabId);
     if (!found) return res.status(404).json({ error: 'Tab not found' });
     
     const { tabState } = found;
+    updateTabRecoveryMeta(tabState, { userId, sessionKey: found.listItemId, tabId, profileDir: session.profileDir, task_id: req.body.task_id || req.body.taskId, siteKey: req.body.siteKey });
     tabState.toolCalls++; tabState.consecutiveTimeouts = 0;
     
     if (mode !== 'fill' && mode !== 'keyboard') {
@@ -2343,6 +2890,7 @@ app.post('/tabs/:tabId/type', async (req, res) => {
       return res.status(400).json({ error: 'ref or selector required for mode=fill' });
     }
     const shouldSubmit = submit || pressEnter;
+    let targetSummary = targetContextFromRef(tabState, ref);
     
     await withTabLock(tabId, async () => {
       // Resolve and focus the target if ref/selector provided
@@ -2355,28 +2903,64 @@ app.post('/tabs/:tabId/type', async (req, res) => {
           locator = refToLocator(tabState.page, ref, tabState.refs);
         }
         if (!locator) { const maxRef = tabState.refs.size > 0 ? `e${tabState.refs.size}` : 'none'; throw new StaleRefsError(ref, maxRef, tabState.refs.size); }
+        targetSummary = targetSummary || targetContextFromRef(tabState, ref);
       }
       
-      if (mode === 'fill') {
-        if (locator) {
-          await locator.fill(text, { timeout: 10000 });
-        } else {
-          await tabState.page.fill(selector, text, { timeout: 10000 });
-        }
-      } else {
-        // keyboard mode — char-by-char real key events (required for Ember/contenteditable)
-        if (locator) {
-          await locator.focus({ timeout: 10000 });
-        } else if (selector) {
-          await tabState.page.focus(selector, { timeout: 10000 });
-        }
-        await tabState.page.keyboard.type(text, { delay });
+      if (!locator && selector) {
+        locator = tabState.page.locator(selector);
       }
-      if (shouldSubmit) await tabState.page.keyboard.press('Enter');
+
+      if (locator) {
+        try {
+          await withActionTimeout(
+            humanPrepareTarget(tabState.page, locator, {
+              profile: humanProfile,
+              viewport: tabState.humanSession?.viewport,
+              behaviorPersona: tabState.humanSession?.behaviorPersona,
+              timeout: 1000,
+              boxTimeout: 500,
+              scrollTimeout: 1000,
+              allowBoundingBoxFallback: true,
+              preferBoundingBox: true,
+              skipReadingPause: true,
+            }),
+            1500,
+            'type prepare timed out'
+          );
+        } catch (err) {
+          log('info', 'type prepare skipped', { reqId: req.reqId, tabId, error: err.message });
+        }
+      }
+
+      if (mode === 'fill') {
+        if (!locator) {
+          throw new Error('ref or selector required for mode=fill');
+        }
+        await humanType(tabState.page, locator, text, {
+          profile: humanProfile,
+          clearFirst,
+          mistakesRate: 0,
+          timeout: 1000,
+          allowDomFocusFallback: true,
+        });
+      } else {
+        if (locator) {
+          await humanType(tabState.page, locator, text, {
+            profile: humanProfile,
+            clearFirst: false,
+            mistakesRate: 0,
+            timeout: 1000,
+            allowDomFocusFallback: true,
+          });
+        } else {
+          await humanType(tabState.page, locator || null, text, { profile: humanProfile, clearFirst: false, mistakesRate: 0 });
+        }
+      }
+      if (shouldSubmit) await humanPress(tabState.page, 'Enter', { profile: humanProfile });
     });
     
     const result = { ok: true, url: tabState.page.url(), title: await tabState.page.title().catch(() => '') };
-    recordTabAction(tabState, { kind: 'type', ref, selector, text, result });
+    recordTabAction(tabState, { kind: 'type', ref, selector, text, target_summary: targetSummary, result });
     pluginEvents.emit('tab:type', { userId: req.body.userId, tabId, text: req.body.text, ref: req.body.ref, mode: req.body.mode || 'fill' });
     res.json(result);
   } catch (err) {
@@ -2387,7 +2971,7 @@ app.post('/tabs/:tabId/type', async (req, res) => {
         const found = session && findTab(session, tabId);
         if (found?.tabState?.page && !found.tabState.page.isClosed()) {
           found.tabState.refs = await refreshTabRefs(found.tabState, { reason: 'type_timeout' });
-          found.tabState.lastSnapshot = null;
+          invalidateTabSnapshot(found.tabState);
           return res.status(500).json({
             error: safeError(err),
             hint: 'The page may have changed. Call snapshot to see the current state and retry.',
@@ -2408,16 +2992,17 @@ app.post('/tabs/:tabId/press', async (req, res) => {
   const tabId = req.params.tabId;
   
   try {
-    const { userId, key } = req.body;
+    const { userId, key, humanProfile = 'fast' } = req.body;
     const session = sessions.get(normalizeUserId(userId));
     const found = session && findTab(session, tabId);
     if (!found) return res.status(404).json({ error: 'Tab not found' });
     
     const { tabState } = found;
+    updateTabRecoveryMeta(tabState, { userId, sessionKey: found.listItemId, tabId, profileDir: session.profileDir, task_id: req.body.task_id || req.body.taskId, siteKey: req.body.siteKey });
     tabState.toolCalls++; tabState.consecutiveTimeouts = 0;
     
     await withTabLock(tabId, async () => {
-      await tabState.page.keyboard.press(key);
+      await humanPress(tabState.page, key, { profile: humanProfile });
     });
     
     const result = { ok: true, url: tabState.page.url(), title: await tabState.page.title().catch(() => '') };
@@ -2433,18 +3018,16 @@ app.post('/tabs/:tabId/press', async (req, res) => {
 // Scroll
 app.post('/tabs/:tabId/scroll', async (req, res) => {
   try {
-    const { userId, direction = 'down', amount = 500 } = req.body;
+    const { userId, direction = 'down', amount = 500, humanProfile = 'fast' } = req.body;
     const session = sessions.get(normalizeUserId(userId));
     const found = session && findTab(session, req.params.tabId);
     if (!found) return res.status(404).json({ error: 'Tab not found' });
     
     const { tabState } = found;
+    updateTabRecoveryMeta(tabState, { userId, sessionKey: found.listItemId, tabId: req.params.tabId, profileDir: session.profileDir, task_id: req.body.task_id || req.body.taskId, siteKey: req.body.siteKey });
     tabState.toolCalls++; tabState.consecutiveTimeouts = 0;
     
-    const isVertical = direction === 'up' || direction === 'down';
-    const delta = (direction === 'up' || direction === 'left') ? -amount : amount;
-    await tabState.page.mouse.wheel(isVertical ? 0 : delta, isVertical ? delta : 0);
-    await tabState.page.waitForTimeout(300);
+    await humanScroll(tabState.page, { direction, amount, profile: humanProfile });
     
     const result = { ok: true, url: tabState.page.url(), title: await tabState.page.title().catch(() => '') };
     recordTabAction(tabState, { kind: 'scroll', direction, amount, result });
@@ -2467,6 +3050,7 @@ app.post('/tabs/:tabId/back', async (req, res) => {
     if (!found) return res.status(404).json({ error: 'Tab not found' });
     
     const { tabState } = found;
+    updateTabRecoveryMeta(tabState, { userId, sessionKey: found.listItemId, tabId, profileDir: session.profileDir, task_id: req.body.task_id || req.body.taskId, siteKey: req.body.siteKey });
     tabState.toolCalls++; tabState.consecutiveTimeouts = 0;
     
     const result = await withTabLock(tabId, async () => {
@@ -2502,16 +3086,18 @@ app.post('/tabs/:tabId/forward', async (req, res) => {
     const session = sessions.get(normalizeUserId(userId));
     const found = session && findTab(session, tabId);
     if (!found) return res.status(404).json({ error: 'Tab not found' });
-    
+
     const { tabState } = found;
+    updateTabRecoveryMeta(tabState, { userId, sessionKey: found.listItemId, tabId, profileDir: session.profileDir, task_id: req.body.task_id || req.body.taskId, siteKey: req.body.siteKey });
     tabState.toolCalls++; tabState.consecutiveTimeouts = 0;
-    
+
     const result = await withTabLock(tabId, async () => {
       await tabState.page.goForward({ timeout: 10000 });
       tabState.refs = await buildRefs(tabState.page);
       return { ok: true, url: tabState.page.url() };
     });
     
+    recordTabAction(tabState, { kind: 'forward', result: { ...result, title: await tabState.page.title().catch(() => '') } });
     res.json(result);
   } catch (err) {
     log('error', 'forward failed', { reqId: req.reqId, error: err.message });
@@ -2528,16 +3114,18 @@ app.post('/tabs/:tabId/refresh', async (req, res) => {
     const session = sessions.get(normalizeUserId(userId));
     const found = session && findTab(session, tabId);
     if (!found) return res.status(404).json({ error: 'Tab not found' });
-    
+
     const { tabState } = found;
+    updateTabRecoveryMeta(tabState, { userId, sessionKey: found.listItemId, tabId, profileDir: session.profileDir, task_id: req.body.task_id || req.body.taskId, siteKey: req.body.siteKey });
     tabState.toolCalls++; tabState.consecutiveTimeouts = 0;
-    
+
     const result = await withTabLock(tabId, async () => {
       await tabState.page.reload({ timeout: 30000 });
       tabState.refs = await buildRefs(tabState.page);
       return { ok: true, url: tabState.page.url() };
     });
     
+    recordTabAction(tabState, { kind: 'refresh', result: { ...result, title: await tabState.page.title().catch(() => '') } });
     res.json(result);
   } catch (err) {
     log('error', 'refresh failed', { reqId: req.reqId, error: err.message });
@@ -2615,6 +3203,23 @@ app.get('/tabs/:tabId/downloads', async (req, res) => {
   }
 });
 
+// Get console/pageerror diagnostics
+app.get('/tabs/:tabId/diagnostics', async (req, res) => {
+  try {
+    const userId = req.query.userId;
+    if (!userId) return res.status(400).json({ error: 'userId required' });
+    const clear = req.query.clear === 'true';
+    const session = sessions.get(normalizeUserId(userId));
+    const found = session && findTab(session, req.params.tabId);
+    if (!found) return res.status(404).json({ error: 'Tab not found' });
+
+    res.json(diagnosticsResponse(found.tabState, clear));
+  } catch (err) {
+    log('error', 'diagnostics failed', { reqId: req.reqId, error: err.message });
+    handleRouteError(err, req, res);
+  }
+});
+
 // Get image elements from current page
 app.get('/tabs/:tabId/images', async (req, res) => {
   try {
@@ -2629,9 +3234,12 @@ app.get('/tabs/:tabId/images', async (req, res) => {
     if (!found) return res.status(404).json({ error: 'Tab not found' });
 
     const { tabState } = found;
+    updateTabRecoveryMeta(tabState, { userId, sessionKey: found.listItemId, tabId: req.params.tabId, profileDir: session.profileDir, task_id: req.query.task_id || req.query.taskId, siteKey: req.query.siteKey });
     tabState.toolCalls++;
 
     const images = await extractPageImages(tabState.page, { includeData, maxBytes, limit });
+    const result = { ok: true, tabId: req.params.tabId, images, url: tabState.page.url(), title: await tabState.page.title().catch(() => '') };
+    recordTabAction(tabState, { kind: 'images', includeData, maxBytes, limit, result });
 
     res.json({ tabId: req.params.tabId, images });
   } catch (err) {
@@ -2651,7 +3259,10 @@ app.get('/tabs/:tabId/screenshot', async (req, res) => {
     if (!found) return res.status(404).json({ error: 'Tab not found' });
     
     const { tabState } = found;
+    updateTabRecoveryMeta(tabState, { userId, sessionKey: found.listItemId, tabId: req.params.tabId, profileDir: session.profileDir, task_id: req.query.task_id || req.query.taskId, siteKey: req.query.siteKey });
+    tabState.toolCalls++; tabState.consecutiveTimeouts = 0;
     const buffer = await tabState.page.screenshot({ type: 'png', fullPage });
+    recordTabAction(tabState, { kind: 'screenshot', fullPage, result: { ok: true, url: tabState.page.url(), title: await tabState.page.title().catch(() => ''), mimeType: 'image/png', bytes: buffer.length } });
     pluginEvents.emit('tab:screenshot', { userId, tabId: req.params.tabId, buffer });
     res.set('Content-Type', 'image/png');
     res.send(buffer);
@@ -2699,13 +3310,21 @@ app.post('/tabs/:tabId/evaluate', express.json({ limit: '1mb' }), async (req, re
 
     session.lastAccess = Date.now();
     const { tabState } = found;
+    updateTabRecoveryMeta(tabState, { userId, sessionKey: found.listItemId, tabId: req.params.tabId, profileDir: session.profileDir, task_id: req.body.task_id || req.body.taskId, siteKey: req.body.siteKey });
     tabState.toolCalls++; tabState.consecutiveTimeouts = 0;
 
     pluginEvents.emit('tab:evaluate', { userId, tabId: req.params.tabId, expression });
     const result = await tabState.page.evaluate(expression);
+    const response = { ok: true, result };
+    recordTabAction(tabState, {
+      kind: 'evaluate',
+      expression,
+      replaySafe: req.body.replaySafe === true || req.body.replay_safe === true,
+      result: { ok: true, url: tabState.page.url(), title: await tabState.page.title().catch(() => ''), resultType: typeof result },
+    });
     pluginEvents.emit('tab:evaluated', { userId, tabId: req.params.tabId, result });
     log('info', 'evaluate', { reqId: req.reqId, tabId: req.params.tabId, userId, resultType: typeof result });
-    res.json({ ok: true, result });
+    res.json(response);
   } catch (err) {
     failuresTotal.labels(classifyError(err), 'evaluate').inc();
     log('error', 'evaluate failed', { reqId: req.reqId, error: err.message });
@@ -2722,6 +3341,8 @@ app.delete('/tabs/:tabId', async (req, res) => {
     const found = session && findTab(session, req.params.tabId);
     if (found) {
       if (found.tabState.navigateAbort) found.tabState.navigateAbort.abort();
+      recordTabAction(found.tabState, { kind: 'close', reason: 'api_delete_tab', result: { ok: true, url: found.tabState.page?.url?.() || '', title: await found.tabState.page?.title?.().catch(() => '') } });
+      markTabRecoveryClosed(found.tabState, { reason: 'api_delete_tab', url: found.tabState.page?.url?.() || undefined, title: await found.tabState.page?.title?.().catch(() => '') || undefined });
       await clearTabDownloads(found.tabState);
       await safePageClose(found.tabState.page);
       found.group.delete(req.params.tabId);
@@ -2748,6 +3369,7 @@ app.delete('/tabs/group/:listItemId', async (req, res) => {
     const group = session?.tabGroups.get(req.params.listItemId);
     if (group) {
       for (const [tabId, tabState] of group) {
+        markTabRecoveryClosed(tabState, { reason: 'api_delete_group', url: tabState.page?.url?.() || undefined, title: await tabState.page?.title?.().catch(() => '') || undefined });
         await clearTabDownloads(tabState);
         await safePageClose(tabState.page);
         const lock = tabLocks.get(tabId);
@@ -2823,6 +3445,7 @@ setInterval(() => {
           if (idleMs >= TAB_INACTIVITY_MS) {
             tabsReapedTotal.inc();
             log('info', 'tab reaped (inactive)', { userId, tabId, listItemId, idleMs, toolCalls: tabState.toolCalls });
+            markTabRecoveryClosed(tabState, { reason: 'tab_inactivity_reaper', url: tabState.page?.url?.() || undefined });
             safePageClose(tabState.page);
             group.delete(tabId);
             { const _l = tabLocks.get(tabId); if (_l) _l.drain(); tabLocks.delete(tabId); }
@@ -2870,7 +3493,7 @@ app.get('/', (req, res) => {
 
 app.post('/memory/record', async (req, res) => {
   try {
-    const { userId, tabId, targetId, siteKey, actionKey = 'default' } = req.body || {};
+    const { userId, tabId, targetId, siteKey, actionKey = 'default', aliases = [], labels = [] } = req.body || {};
     if (!userId) return res.status(400).json({ error: 'userId is required' });
     if (!siteKey) return res.status(400).json({ error: 'siteKey is required' });
     const resolvedTabId = tabId || targetId;
@@ -2878,7 +3501,7 @@ app.post('/memory/record', async (req, res) => {
     const session = sessions.get(normalizeUserId(userId));
     const found = session && findTab(session, resolvedTabId);
     if (!found) return res.status(404).json({ error: 'Tab not found' });
-    const saved = await recordAgentHistoryFlow(found.tabState, siteKey, actionKey);
+    const saved = await recordAgentHistoryFlow(found.tabState, siteKey, actionKey, { aliases, labels });
     res.json({ ok: true, path: saved.path, siteKey, actionKey });
   } catch (err) {
     log('error', 'agent history record endpoint failed', { reqId: req.reqId, error: err.message });
@@ -2886,9 +3509,36 @@ app.post('/memory/record', async (req, res) => {
   }
 });
 
+app.get('/memory/search', async (req, res) => {
+  try {
+    const siteKey = req.query?.siteKey;
+    const query = req.query?.q || req.query?.query || '';
+    if (!siteKey) return res.status(400).json({ error: 'siteKey is required' });
+    const results = await searchFlows({ siteKey, query });
+    res.json({ ok: true, results });
+  } catch (err) {
+    log('error', 'agent history search endpoint failed', { reqId: req.reqId, error: err.message });
+    handleRouteError(err, req, res);
+  }
+});
+
+app.delete('/memory/delete', async (req, res) => {
+  try {
+    const siteKey = req.query?.siteKey || req.body?.siteKey;
+    const actionKey = req.query?.actionKey || req.body?.actionKey || 'default';
+    if (!siteKey) return res.status(400).json({ error: 'siteKey is required' });
+    const result = await deleteAgentHistoryFlow(siteKey, actionKey);
+    res.json(result);
+  } catch (err) {
+    log('error', 'agent history delete endpoint failed', { reqId: req.reqId, error: err.message });
+    handleRouteError(err, req, res);
+  }
+});
+
 app.post('/memory/replay', async (req, res) => {
   try {
-    const { userId, tabId, targetId, siteKey, actionKey = 'default' } = req.body || {};
+    const { userId, tabId, targetId, siteKey, actionKey = 'default', learnRepairs = false, parameters = {} } = req.body || {};
+    const allowLlmFallback = explicitAllowLlmRepair(req.body || {});
     if (!userId) return res.status(400).json({ error: 'userId is required' });
     if (!siteKey) return res.status(400).json({ error: 'siteKey is required' });
     const resolvedTabId = tabId || targetId || fly.makeTabId();
@@ -2896,54 +3546,152 @@ app.post('/memory/replay', async (req, res) => {
     let found = findTab(session, resolvedTabId);
     if (!found) {
       const page = await session.context.newPage();
-      const tabState = createTabState(page);
+      const tabState = createTabState(page, { userId, sessionKey: 'default', tabId: resolvedTabId });
       attachDownloadListener(tabState, resolvedTabId, log, pluginEvents, userId);
       getTabGroup(session, 'default').set(resolvedTabId, tabState);
       refreshActiveTabsGauge();
       found = findTab(session, resolvedTabId);
     }
     const { tabState } = found;
-    const replay = await replayAgentHistory(siteKey, actionKey, {
-      navigate: async (step) => {
-        await tabState.page.goto(step.url, { waitUntil: 'domcontentloaded', timeout: 30000 });
-        tabState.lastSnapshot = null;
-        tabState.refs = await buildRefs(tabState.page);
-        return { ok: true, url: tabState.page.url() };
-      },
-      click: async (step) => {
-        const locator = step.ref ? refToLocator(tabState.page, step.ref, tabState.refs) : tabState.page.locator(step.selector);
-        if (!locator) return { ok: false, error: `Ref not found: ${step.ref}` };
-        await locator.click({ timeout: 10000 });
-        await tabState.page.waitForTimeout(500);
-        tabState.lastSnapshot = null;
-        tabState.refs = await buildRefs(tabState.page);
-        return { ok: true, url: tabState.page.url() };
-      },
-      type: async (step) => {
-        const locator = step.ref ? refToLocator(tabState.page, step.ref, tabState.refs) : null;
-        if (locator) await locator.fill(step.text, { timeout: 10000 });
-        else await tabState.page.fill(step.selector, step.text, { timeout: 10000 });
-        return { ok: true, url: tabState.page.url() };
-      },
-      press: async (step) => {
-        await tabState.page.keyboard.press(step.key);
-        return { ok: true, url: tabState.page.url() };
-      },
-      scroll: async (step) => {
-        const direction = step.direction || 'down';
-        const amount = step.amount || 500;
-        const isVertical = direction === 'up' || direction === 'down';
-        const delta = (direction === 'up' || direction === 'left') ? -amount : amount;
-        await tabState.page.mouse.wheel(isVertical ? 0 : delta, isVertical ? delta : 0);
-        return { ok: true, url: tabState.page.url() };
-      },
-      back: async () => {
-        await tabState.page.goBack({ timeout: 10000 }).catch(() => {});
-        tabState.refs = await buildRefs(tabState.page);
-        return { ok: true, url: tabState.page.url() };
-      },
+    const loaded = await loadAgentHistory(siteKey, actionKey);
+    const steps = loaded.payload?.hermes_meta?.derived_flow?.steps || [];
+    if (!Array.isArray(steps) || steps.length === 0) {
+      throw new Error(`AgentHistory flow has no replayable steps for ${siteKey}/${actionKey}`);
+    }
+    const replayRefreshRefs = async (reason = 'memory_replay_refresh') => {
+      invalidateTabSnapshot(tabState);
+      tabState.refs = await refreshTabRefs(tabState, { reason });
+      return tabState.refs;
+    };
+    const replayHandlers = createMemoryReplayHandlers({
+      tabState,
+      refreshRefs: replayRefreshRefs,
+      waitForPageReady,
     });
-    res.json({ ...replay, targetId: resolvedTabId, tabId: resolvedTabId, url: tabState.page.url() });
+    const replay = await replayStepsSelfHealing(steps, {
+      handlers: {
+        ...replayHandlers,
+        navigate: async (step) => {
+          await tabState.page.goto(step.url, { waitUntil: 'domcontentloaded', timeout: 30000 });
+          invalidateTabSnapshot(tabState);
+          tabState.refs = await buildRefs(tabState.page);
+          return { ok: true, url: tabState.page.url() };
+        },
+        click: async (step) => {
+          const locator = step.ref ? refToLocator(tabState.page, step.ref, tabState.refs) : tabState.page.locator(step.selector);
+          if (!locator) return { ok: false, error: `Ref not found: ${step.ref}` };
+          await humanPrepareTarget(tabState.page, locator, {
+            behaviorPersona: tabState.humanSession?.behaviorPersona,
+            viewport: tabState.humanSession?.viewport,
+          });
+          const clickResult = await humanClick(tabState.page, locator, {
+            profile: req.body.humanProfile || 'fast',
+            from: getHumanCursor(tabState.humanSession),
+            viewport: tabState.humanSession?.viewport,
+          });
+          updateHumanCursor(tabState.humanSession, clickResult.position);
+          await tabState.page.waitForTimeout(500);
+          invalidateTabSnapshot(tabState);
+          tabState.refs = await buildRefs(tabState.page);
+          return { ok: true, url: tabState.page.url() };
+        },
+        type: async (step) => {
+          const locator = step.ref ? refToLocator(tabState.page, step.ref, tabState.refs) : tabState.page.locator(step.selector);
+          if (!locator) return { ok: false, error: `Ref not found: ${step.ref}` };
+          await humanPrepareTarget(tabState.page, locator, { behaviorPersona: tabState.humanSession?.behaviorPersona });
+          await humanType(tabState.page, locator, step.text, {
+            profile: req.body.humanProfile || 'fast',
+            clearFirst: true,
+            mistakesRate: 0,
+          });
+          invalidateTabSnapshot(tabState);
+          return { ok: true, url: tabState.page.url() };
+        },
+        press: async (step) => {
+          await humanPress(tabState.page, step.key, { profile: req.body.humanProfile || 'fast' });
+          invalidateTabSnapshot(tabState);
+          return { ok: true, url: tabState.page.url() };
+        },
+        scroll: async (step) => {
+          await humanScroll(tabState.page, {
+            direction: step.direction || 'down',
+            amount: step.amount || 500,
+            profile: req.body.humanProfile || 'fast',
+          });
+          invalidateTabSnapshot(tabState);
+          return { ok: true, url: tabState.page.url() };
+        },
+        back: async () => {
+          await tabState.page.goBack({ timeout: 10000 }).catch(() => {});
+          tabState.refs = await buildRefs(tabState.page);
+          return { ok: true, url: tabState.page.url() };
+        },
+      },
+      refreshRefs: async () => {
+        await replayRefreshRefs('memory_replay_repair');
+      },
+      getCandidates: async () => candidatesFromRefs(tabState.refs),
+      detectInterrupt: async () => detectInterrupt({
+        url: tabState.page.url(),
+        title: await tabState.page.title().catch(() => ''),
+        text: await tabState.page.evaluate(() => document.body?.innerText?.slice(0, 1500) || '').catch(() => ''),
+      }),
+      adaptivePacing: (interrupt) => adaptivePacingForInterrupt(interrupt, {
+        profile: req.body.humanProfile || 'medium',
+        consecutiveInterrupts: tabState.consecutiveTimeouts,
+      }),
+      waitForPacing: async (delayMs) => {
+        await tabState.page.waitForTimeout(Math.min(delayMs, 3000));
+      },
+      resolveInterrupt: async (interrupt) => {
+        if (interrupt?.type !== 'cookie_banner') return { ok: true, skipped: true };
+        tabState.refs = await refreshTabRefs(tabState, { reason: 'memory_replay_interrupt' });
+        const candidate = chooseCookieConsentCandidate(candidatesFromRefs(tabState.refs));
+        if (!candidate?.ref) return { ok: false, error: 'No cookie consent candidate found' };
+        const locator = refToLocator(tabState.page, candidate.ref, tabState.refs);
+        if (!locator) return { ok: false, error: `Ref not found: ${candidate.ref}` };
+        await humanPrepareTarget(tabState.page, locator, { behaviorPersona: tabState.humanSession?.behaviorPersona });
+        const clickResult = await humanClick(tabState.page, locator, {
+          profile: req.body.humanProfile || 'fast',
+          from: getHumanCursor(tabState.humanSession),
+        });
+        updateHumanCursor(tabState.humanSession, clickResult.position);
+        await tabState.page.waitForTimeout(500);
+        tabState.refs = await refreshTabRefs(tabState, { reason: 'memory_replay_interrupt_resolved' });
+        return { ok: true, ref: candidate.ref, type: interrupt.type };
+      },
+      validate: async (expected) => validateOutcome(expected, {
+        getUrl: async () => tabState.page.url(),
+        getTitle: async () => tabState.page.title(),
+        hasText: async (text) => tabState.page.getByText(text).first().isVisible({ timeout: 1000 }).catch(() => false),
+        hasSelector: async (selector) => tabState.page.locator(selector).first().isVisible({ timeout: 1000 }).catch(() => false),
+      }),
+      parameters,
+      ...(allowLlmFallback ? {
+        allowLlmFallback: true,
+        plannerFallback: createManagedPlannerFallback({ tabState, candidatesFromRefs }),
+      } : {}),
+    });
+    let learned = false;
+    let learnedPath;
+    if (learnRepairs === true && replay.ok && replay.results?.some((result) => result.repaired_step)) {
+      const updatedSteps = steps.map((step, index) => replay.results[index]?.repaired_step || step);
+      const saved = await persistAgentHistorySteps({
+        siteKey,
+        actionKey,
+        steps: updatedSteps,
+        learnedFrom: loaded.path,
+      });
+      learned = true;
+      learnedPath = saved.path;
+    }
+    res.json({
+      ...replay,
+      targetId: resolvedTabId,
+      tabId: resolvedTabId,
+      url: tabState.page.url(),
+      ...(learned ? { learned, learnedPath } : {}),
+    });
   } catch (err) {
     log('error', 'agent history replay endpoint failed', { reqId: req.reqId, error: err.message });
     handleRouteError(err, req, res);
@@ -3010,7 +3758,7 @@ app.post('/tabs/open', async (req, res) => {
     
     const page = await session.context.newPage();
     const tabId = fly.makeTabId();
-    const tabState = createTabState(page);
+    const tabState = createTabState(page, { userId, sessionKey: listItemId, tabId });
     attachDownloadListener(tabState, tabId, log, pluginEvents, userId);
     group.set(tabId, tabState);
     refreshActiveTabsGauge();
@@ -3102,7 +3850,7 @@ app.post('/navigate', async (req, res) => {
     const result = await withTabLock(targetId, async () => {
       await withPageLoadDuration('navigate', () => tabState.page.goto(url, { waitUntil: 'domcontentloaded', timeout: 30000 }));
       tabState.visitedUrls.add(url);
-      tabState.lastSnapshot = null;
+      invalidateTabSnapshot(tabState);
       
       // Google SERP: defer extraction to snapshot call
       if (isGoogleSerp(tabState.page.url())) {
@@ -3127,6 +3875,8 @@ app.get('/snapshot', async (req, res) => {
   try {
     const { targetId, userId, format = 'text' } = req.query;
     const offset = parseInt(req.query.offset) || 0;
+    const includeScreenshot = req.query.includeScreenshot === 'true';
+    const full = req.query.full === 'true';
     if (!userId) {
       return res.status(400).json({ error: 'userId is required' });
     }
@@ -3138,16 +3888,18 @@ app.get('/snapshot', async (req, res) => {
     }
     
     const { tabState } = found;
+    updateTabRecoveryMeta(tabState, { userId, sessionKey: found.listItemId, tabId: targetId, profileDir: session.profileDir, task_id: req.query.task_id || req.query.taskId, siteKey: req.query.siteKey });
     tabState.toolCalls++; tabState.consecutiveTimeouts = 0;
 
     // Cached chunk retrieval
-    if (offset > 0 && tabState.lastSnapshot) {
+    if (offset > 0 && tabState.lastSnapshot && tabState.lastSnapshotFull === full) {
       const win = windowSnapshot(tabState.lastSnapshot, offset);
       const response = { ok: true, format: 'aria', targetId, url: tabState.page.url(), snapshot: win.text, refsCount: tabState.refs.size, truncated: win.truncated, totalChars: win.totalChars, hasMore: win.hasMore, nextOffset: win.nextOffset };
-      if (req.query.includeScreenshot === 'true') {
+      if (includeScreenshot) {
         const pngBuffer = await tabState.page.screenshot({ type: 'png' });
         response.screenshot = { data: pngBuffer.toString('base64'), mimeType: 'image/png' };
       }
+      recordTabAction(tabState, { kind: 'snapshot', full, includeScreenshot, offset, result: { ...response, title: await tabState.page.title().catch(() => '') } });
       return res.json(response);
     }
 
@@ -3157,20 +3909,23 @@ app.get('/snapshot', async (req, res) => {
     if (isGoogleSerp(pageUrl)) {
       const { refs: googleRefs, snapshot: googleSnapshot } = await extractGoogleSerp(tabState.page);
       tabState.refs = googleRefs;
-      tabState.lastSnapshot = googleSnapshot;
-      snapshotBytes.labels('google_serp').observe(Buffer.byteLength(googleSnapshot, 'utf8'));
-      const annotatedYaml = googleSnapshot;
-      const win = windowSnapshot(annotatedYaml, 0);
+      const annotatedYaml = full ? googleSnapshot : compactSnapshot(googleSnapshot);
+      tabState.lastSnapshot = annotatedYaml;
+      tabState.lastSnapshotFull = full;
+      snapshotBytes.labels('google_serp').observe(Buffer.byteLength(annotatedYaml, 'utf8'));
+      tabState.lastSnapshotUrl = pageUrl;
+      const win = windowSnapshot(annotatedYaml, offset);
       const response = {
         ok: true, format: 'aria', targetId, url: pageUrl,
         snapshot: win.text, refsCount: tabState.refs.size,
         truncated: win.truncated, totalChars: win.totalChars,
         hasMore: win.hasMore, nextOffset: win.nextOffset,
       };
-      if (req.query.includeScreenshot === 'true') {
+      if (includeScreenshot) {
         const pngBuffer = await tabState.page.screenshot({ type: 'png' });
         response.screenshot = { data: pngBuffer.toString('base64'), mimeType: 'image/png' };
       }
+      recordTabAction(tabState, { kind: 'snapshot', full, includeScreenshot, offset, result: { ...response, title: await tabState.page.title().catch(() => '') } });
       return res.json(response);
     }
     
@@ -3178,33 +3933,14 @@ app.get('/snapshot', async (req, res) => {
     
     const ariaYaml = await getAriaSnapshot(tabState.page);
     
-    // Annotate YAML with ref IDs
-    let annotatedYaml = ariaYaml || '';
-    if (annotatedYaml && tabState.refs.size > 0) {
-      const refsByKey = new Map();
-      for (const [refId, el] of tabState.refs) {
-        const key = `${el.role}:${el.name || ''}`;
-        if (!refsByKey.has(key)) refsByKey.set(key, refId);
-      }
-      
-      const lines = annotatedYaml.split('\n');
-      annotatedYaml = lines.map(line => {
-        const match = line.match(/^(\s*)-\s+(\w+)(?:\s+"([^"]*)")?/);
-        if (match) {
-          const [, indent, role, name] = match;
-          const key = `${role}:${name || ''}`;
-          const refId = refsByKey.get(key);
-          if (refId) {
-            return line.replace(/^(\s*-\s+\w+)/, `$1 [${refId}]`);
-          }
-        }
-        return line;
-      }).join('\n');
-    }
-    
+    let annotatedYaml = annotateAriaSnapshot(ariaYaml, tabState.refs);
+    if (!full) annotatedYaml = compactSnapshot(annotatedYaml);
+
     tabState.lastSnapshot = annotatedYaml;
-    if (annotatedYaml) snapshotBytes.labels('full').observe(Buffer.byteLength(annotatedYaml, 'utf8'));
-    const win = windowSnapshot(annotatedYaml, 0);
+    tabState.lastSnapshotFull = full;
+    tabState.lastSnapshotUrl = tabState.page.url();
+    if (annotatedYaml) snapshotBytes.labels(full ? 'full' : 'compact').observe(Buffer.byteLength(annotatedYaml, 'utf8'));
+    const win = windowSnapshot(annotatedYaml, offset);
 
     const response = {
       ok: true,
@@ -3219,11 +3955,12 @@ app.get('/snapshot', async (req, res) => {
       nextOffset: win.nextOffset,
     };
 
-    if (req.query.includeScreenshot === 'true') {
+    if (includeScreenshot) {
       const pngBuffer = await tabState.page.screenshot({ type: 'png' });
       response.screenshot = { data: pngBuffer.toString('base64'), mimeType: 'image/png' };
     }
 
+    recordTabAction(tabState, { kind: 'snapshot', full, includeScreenshot, offset, result: { ...response, title: await tabState.page.title().catch(() => '') } });
     res.json(response);
   } catch (err) {
     log('error', 'openclaw snapshot failed', { reqId: req.reqId, error: err.message });
@@ -3256,25 +3993,19 @@ app.post('/act', async (req, res) => {
     const result = await withTabLock(targetId, async () => {
       switch (kind) {
         case 'click': {
-          const { ref, selector, doubleClick } = params;
+          const { ref, selector } = params;
           if (!ref && !selector) {
             throw new Error('ref or selector required');
           }
           
           const doClick = async (locatorOrSelector, isLocator) => {
             const locator = isLocator ? locatorOrSelector : tabState.page.locator(locatorOrSelector);
-            const clickOpts = { timeout: 3000 };
-            if (doubleClick) clickOpts.clickCount = 2;
-            
-            try {
-              await locator.click(clickOpts);
-            } catch (err) {
-              if (err.message.includes('intercepts pointer events')) {
-                await locator.click({ ...clickOpts, force: true });
-              } else {
-                throw err;
-              }
-            }
+            await humanPrepareTarget(tabState.page, locator, { behaviorPersona: tabState.humanSession?.behaviorPersona });
+            const clickResult = await humanClick(tabState.page, locator, {
+              profile: params.humanProfile || 'fast',
+              from: getHumanCursor(tabState.humanSession),
+            });
+            updateHumanCursor(tabState.humanSession, clickResult.position);
           };
           
           if (ref) {
@@ -3318,28 +4049,30 @@ app.post('/act', async (req, res) => {
             if (!locator) { const maxRef = tabState.refs.size > 0 ? `e${tabState.refs.size}` : 'none'; throw new StaleRefsError(ref, maxRef, tabState.refs.size); }
           }
           
+          if (!locator && selector) {
+            locator = tabState.page.locator(selector);
+          }
+
+          if (locator) {
+            await humanPrepareTarget(tabState.page, locator, { behaviorPersona: tabState.humanSession?.behaviorPersona });
+          }
+
           if (mode === 'fill') {
-            if (locator) {
-              await locator.fill(text, { timeout: 10000 });
-            } else {
-              await tabState.page.fill(selector, text, { timeout: 10000 });
-            }
+            await humanType(tabState.page, locator, text, { profile: params.humanProfile || 'fast', clearFirst: true, mistakesRate: 0 });
           } else {
             if (locator) {
               await locator.focus({ timeout: 10000 });
-            } else if (selector) {
-              await tabState.page.focus(selector, { timeout: 10000 });
             }
-            await tabState.page.keyboard.type(text, { delay });
+            await humanType(tabState.page, locator || null, text, { profile: params.humanProfile || 'fast', clearFirst: false, mistakesRate: 0 });
           }
-          if (submit) await tabState.page.keyboard.press('Enter');
+          if (submit) await humanPress(tabState.page, 'Enter', { profile: params.humanProfile || 'fast' });
           return { ok: true, targetId };
         }
         
         case 'press': {
           const { key } = params;
           if (!key) throw new Error('key is required');
-          await tabState.page.keyboard.press(key);
+          await humanPress(tabState.page, key, { profile: params.humanProfile || 'fast' });
           return { ok: true, targetId };
         }
         
@@ -3353,12 +4086,9 @@ app.post('/act', async (req, res) => {
               locator = refToLocator(tabState.page, ref, tabState.refs);
             }
             if (!locator) { const maxRef = tabState.refs.size > 0 ? `e${tabState.refs.size}` : 'none'; throw new StaleRefsError(ref, maxRef, tabState.refs.size); }
-            await locator.scrollIntoViewIfNeeded({ timeout: 5000 });
-          } else {
-            const isVertical = direction === 'up' || direction === 'down';
-            const delta = (direction === 'up' || direction === 'left') ? -amount : amount;
-            await tabState.page.mouse.wheel(isVertical ? 0 : delta, isVertical ? delta : 0);
+            await humanPrepareTarget(tabState.page, locator, { behaviorPersona: tabState.humanSession?.behaviorPersona });
           }
+          await humanScroll(tabState.page, { direction, amount, profile: params.humanProfile || 'fast' });
           await tabState.page.waitForTimeout(300);
           return { ok: true, targetId };
         }
@@ -3367,17 +4097,26 @@ app.post('/act', async (req, res) => {
           const { ref, selector } = params;
           if (!ref && !selector) throw new Error('ref or selector required');
           
+          let locator;
           if (ref) {
-            let locator = refToLocator(tabState.page, ref, tabState.refs);
+            locator = refToLocator(tabState.page, ref, tabState.refs);
             if (!locator) {
               tabState.refs = await buildRefs(tabState.page);
               locator = refToLocator(tabState.page, ref, tabState.refs);
             }
             if (!locator) { const maxRef = tabState.refs.size > 0 ? `e${tabState.refs.size}` : 'none'; throw new StaleRefsError(ref, maxRef, tabState.refs.size); }
-            await locator.hover({ timeout: 5000 });
           } else {
-            await tabState.page.locator(selector).hover({ timeout: 5000 });
+            locator = tabState.page.locator(selector);
           }
+          await humanPrepareTarget(tabState.page, locator, { behaviorPersona: tabState.humanSession?.behaviorPersona });
+          const hoverBox = await locator.boundingBox();
+          if (!hoverBox) throw new Error('hover target is not visible');
+          const hoverMove = await humanMove(tabState.page, {
+            from: getHumanCursor(tabState.humanSession),
+            to: { x: hoverBox.x + hoverBox.width / 2, y: hoverBox.y + hoverBox.height / 2 },
+            profile: params.humanProfile || 'fast',
+          });
+          updateHumanCursor(tabState.humanSession, hoverMove.position);
           return { ok: true, targetId };
         }
         
@@ -3394,6 +4133,10 @@ app.post('/act', async (req, res) => {
         }
         
         case 'close': {
+          const url = tabState.page?.url?.() || undefined;
+          const title = await tabState.page?.title?.().catch(() => '') || undefined;
+          recordTabAction(tabState, { kind: 'close', reason: 'act_close', result: { ok: true, url, title } });
+          markTabRecoveryClosed(tabState, { reason: 'act_close', url, title });
           await safePageClose(tabState.page);
           found.group.delete(targetId);
           { const _l = tabLocks.get(targetId); if (_l) _l.drain(); tabLocks.delete(targetId); }
@@ -3406,7 +4149,7 @@ app.post('/act', async (req, res) => {
     });
     
     const actionResult = { ...result, url: result.url || tabState.page.url(), title: await tabState.page.title().catch(() => '') };
-    if (['click', 'type', 'press', 'scroll', 'scrollIntoView'].includes(kind)) {
+    if (['click', 'type', 'press', 'scroll', 'scrollIntoView', 'wait', 'hover'].includes(kind)) {
       recordTabAction(tabState, {
         kind: kind === 'scrollIntoView' ? 'scroll' : kind,
         ref: params.ref,
