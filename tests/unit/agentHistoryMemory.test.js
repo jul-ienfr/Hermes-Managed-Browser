@@ -89,6 +89,207 @@ test('preserves target_summary on recorded browser actions', async () => {
   expect(latest.hermes_meta.derived_flow.steps[1].target_summary).toEqual({ role: 'button', name: 'continuer' });
 });
 
+test('preserves target_summary.dom_signature through record, persist, and load without duplication', async () => {
+  const tabState = memory.createMemoryTabState();
+  const domSignature = {
+    tag: 'button',
+    text: 'continue',
+    attributes: { type: 'button', 'aria-label': 'Continue' },
+    parent: { tag: 'form', text: 'Sign in' },
+    siblings: ['input', 'button'],
+    path: ['main', 'form', 'button'],
+    depth: 3,
+    index: 1,
+    nearby_text: ['Email', 'Password'],
+  };
+
+  await memory.recordSuccessfulBrowserAction(tabState, {
+    kind: 'click',
+    ref: 'e2',
+    target_summary: { role: 'button', name: 'Continue', dom_signature: domSignature },
+    result: { ok: true, url: 'https://example.com/login', title: 'Login' },
+  });
+
+  expect(tabState.agentHistorySteps[0].target_summary.dom_signature).toEqual(domSignature);
+  expect(tabState.agentHistorySteps[0].dom_signature).toBeUndefined();
+
+  const loaded = await memory.loadAgentHistory('example.com', 'latest');
+  const loadedStep = loaded.payload.hermes_meta.derived_flow.steps[0];
+  expect(loadedStep.target_summary.dom_signature).toEqual(domSignature);
+  expect(loadedStep.dom_signature).toBeUndefined();
+  expect(loaded.payload.history[0].target_summary.dom_signature).toEqual(domSignature);
+});
+
+test('preserves direct dom_signature through record, persist, and load', async () => {
+  const tabState = memory.createMemoryTabState();
+  const domSignature = {
+    tag: 'a',
+    text: 'details',
+    attributes: { href: '/items/123', title: 'Details' },
+    parent: { tag: 'article' },
+    path: ['main', 'article', 'a'],
+    depth: 2,
+    index: 0,
+  };
+
+  await memory.recordSuccessfulBrowserAction(tabState, {
+    kind: 'click',
+    ref: 'e7',
+    target_summary: { role: 'link', name: 'Details' },
+    dom_signature: domSignature,
+    result: { ok: true, url: 'https://example.com/items' },
+  });
+  await memory.persistAgentHistorySteps({
+    siteKey: 'example.com',
+    actionKey: 'open_details',
+    steps: tabState.agentHistorySteps,
+  });
+
+  expect(tabState.agentHistorySteps[0].dom_signature).toEqual(domSignature);
+  const loaded = await memory.loadAgentHistory('example.com', 'open_details');
+  expect(loaded.payload.hermes_meta.derived_flow.steps[0].dom_signature).toEqual(domSignature);
+  expect(loaded.payload.history[0].dom_signature).toEqual(domSignature);
+});
+
+test('keeps parameterized messages redacted while preserving structural dom_signature metadata', async () => {
+  const tabState = memory.createMemoryTabState();
+  const domSignature = {
+    tag: 'textarea',
+    attributes: { placeholder: 'Message', 'aria-label': 'Message' },
+    parent: { tag: 'form' },
+    path: ['main', 'form', 'textarea'],
+    depth: 2,
+    index: 0,
+  };
+
+  await memory.recordSuccessfulBrowserAction(tabState, {
+    kind: 'type',
+    selector: 'textarea[aria-label="Message"]',
+    text: 'private one-off reply with secret price 3900',
+    target_summary: { role: 'textbox', name: 'Message', dom_signature: domSignature },
+    dom_signature: domSignature,
+    result: { ok: true, url: 'https://marketplace.example/conversations/123' },
+  });
+
+  const loaded = await memory.loadAgentHistory('marketplace.example', 'latest');
+  const serialized = JSON.stringify(loaded.payload);
+  expect(loaded.payload.hermes_meta.derived_flow.steps[0]).toMatchObject({
+    text: '{{message}}',
+    text_parameterized: true,
+    original_text_redacted: true,
+    target_summary: { dom_signature: domSignature },
+  });
+  expect(loaded.payload.hermes_meta.derived_flow.steps[0].dom_signature).toBeUndefined();
+  expect(serialized).not.toContain('private one-off reply');
+  expect(serialized).not.toContain('3900');
+});
+
+test('applies learned DOM repair payloads with provenance without leaking profile metadata or secrets', async () => {
+  const oldSignature = { tag: 'button', text: 'Old', path: ['main', 'button'], depth: 1, index: 0 };
+  const newSignature = { tag: 'button', text: 'New', path: ['main', 'section', 'button'], depth: 2, index: 1 };
+  const sourcePath = path.join(tmpDir, 'example.com', 'checkout.AgentHistory.json');
+
+  await memory.persistAgentHistorySteps({
+    siteKey: 'example.com',
+    actionKey: 'checkout',
+    steps: [{
+      kind: 'click',
+      ref: 'old-ref',
+      target_summary: { role: 'button', name: 'Old', dom_signature: oldSignature },
+      text: '__REDACTED__',
+      text_redacted: true,
+    }],
+  });
+
+  const saved = await memory.applyLearnedDomRepair({
+    siteKey: 'example.com',
+    actionKey: 'checkout',
+    sourcePath,
+    payload: {
+      mode: 'dom_signature_repaired',
+      old_ref: 'old-ref',
+      new_ref: 'new-ref',
+      original_ref: 'old-ref',
+      repaired_ref: 'new-ref',
+      score: 94,
+      candidate: { ref: 'new-ref', role: 'button', name: 'New', dom_signature: newSignature, profile: 'personal-profile' },
+      original_step: {
+        kind: 'click',
+        ref: 'old-ref',
+        target_summary: { role: 'button', name: 'Old', dom_signature: oldSignature },
+      },
+      repaired_step: {
+        kind: 'click',
+        ref: 'new-ref',
+        target_summary: { role: 'button', name: 'New', dom_signature: newSignature },
+      },
+    },
+  });
+
+  const serialized = JSON.stringify(saved.payload);
+  const repaired = saved.payload.hermes_meta.derived_flow.steps[0];
+  expect(saved.path).toBe(path.join(tmpDir, 'example.com', 'checkout.AgentHistory.json'));
+  expect(repaired).toMatchObject({
+    kind: 'click',
+    ref: 'new-ref',
+    text: '__REDACTED__',
+    text_redacted: true,
+    repair_provenance: {
+      mode: 'dom_signature_repaired',
+      old_ref: 'old-ref',
+      new_ref: 'new-ref',
+      original_ref: 'old-ref',
+      repaired_ref: 'new-ref',
+      score: 94,
+      candidate: { ref: 'new-ref', role: 'button', name: 'New', dom_signature: newSignature },
+      original_step: expect.objectContaining({ ref: 'old-ref' }),
+      repaired_step: expect.objectContaining({ ref: 'new-ref' }),
+    },
+  });
+  expect(saved.payload.hermes_meta.learned_from).toMatchObject({ path: sourcePath, timestamp: expect.any(String) });
+  expect(serialized).not.toContain('personal-profile');
+});
+
+test('preserves learned repair metadata and dom signatures in saved flows', async () => {
+  const oldSignature = { tag: 'button', text: 'Old', path: ['main', 'button'], depth: 1, index: 0 };
+  const newSignature = { tag: 'button', text: 'New', path: ['main', 'section', 'button'], depth: 2, index: 1 };
+
+  await memory.persistAgentHistorySteps({
+    siteKey: 'example.com',
+    actionKey: 'learned_dom_repair',
+    learnedFrom: '/previous/example.com/learned_dom_repair.AgentHistory.json',
+    steps: [{
+      kind: 'click',
+      ref: 'new-ref',
+      target_summary: { role: 'button', name: 'New', dom_signature: newSignature },
+      dom_signature: oldSignature,
+      repair_provenance: {
+        mode: 'dom_signature_repaired',
+        original_ref: 'old-ref',
+        repaired_ref: 'new-ref',
+        score: 0.93,
+      },
+    }],
+  });
+
+  const loaded = await memory.loadAgentHistory('example.com', 'learned_dom_repair');
+  expect(loaded.payload.hermes_meta.learned_from).toMatchObject({
+    path: '/previous/example.com/learned_dom_repair.AgentHistory.json',
+    timestamp: expect.any(String),
+  });
+  expect(loaded.payload.hermes_meta.derived_flow.steps[0]).toMatchObject({
+    ref: 'new-ref',
+    dom_signature: oldSignature,
+    target_summary: { dom_signature: newSignature },
+    repair_provenance: {
+      mode: 'dom_signature_repaired',
+      original_ref: 'old-ref',
+      repaired_ref: 'new-ref',
+      score: 0.93,
+    },
+  });
+});
+
 test('preserves expected_outcome on recorded browser actions', async () => {
   const tabState = memory.createMemoryTabState();
 
@@ -231,18 +432,33 @@ test('marks close steps as non replayable with final url and title', async () =>
   });
 });
 
-test('redacts password-like typed values', async () => {
+test('redacts password OTP card and token-like typed values', async () => {
   const tabState = memory.createMemoryTabState();
-  await memory.recordSuccessfulBrowserAction(tabState, {
-    kind: 'type',
-    ref: 'e1',
-    text: 'super-secret',
-    target_summary: { attributes: { type: 'password' } },
-    result: { ok: true, url: 'https://example.com/login' },
-  });
+  const sensitiveInputs = [
+    { text: 'super-secret', target_summary: { attributes: { type: 'password' } } },
+    { text: '123456', target_summary: { attributes: { placeholder: 'OTP code' } } },
+    { text: '4111 1111 1111 1111', target_summary: { attributes: { placeholder: 'Card number' } } },
+    { text: 'tok_1234567890abcdefghijklmnopqrstuv', target_summary: { attributes: { placeholder: 'API token' } } },
+  ];
 
-  expect(tabState.agentHistorySteps[0].text).toBe('__REDACTED__');
-  expect(tabState.agentHistorySteps[0].text_redacted).toBe(true);
+  for (const input of sensitiveInputs) {
+    await memory.recordSuccessfulBrowserAction(tabState, {
+      kind: 'type',
+      ref: 'e1',
+      ...input,
+      result: { ok: true, url: 'https://example.com/login' },
+    });
+  }
+
+  for (const step of tabState.agentHistorySteps) {
+    expect(step.text).toBe('__REDACTED__');
+    expect(step.text_redacted).toBe(true);
+  }
+  const serialized = JSON.stringify(tabState.agentHistorySteps);
+  expect(serialized).not.toContain('super-secret');
+  expect(serialized).not.toContain('123456');
+  expect(serialized).not.toContain('4111');
+  expect(serialized).not.toContain('tok_');
 });
 
 test('keeps normal non-sensitive type actions unchanged', async () => {
@@ -377,6 +593,155 @@ test('replay substitutes supplied runtime parameters for parameterized typed val
 
   expect(result.ok).toBe(true);
   expect(calls).toEqual([['type', 'fresh approved answer']]);
+});
+
+test('replay refuses missing query location and message runtime placeholders', async () => {
+  await memory.persistAgentHistorySteps({
+    siteKey: 'example.com',
+    actionKey: 'parameterized_search_message',
+    steps: [
+      { kind: 'navigate', url: 'https://example.com/search?q={{query}}&near={{location}}' },
+      { kind: 'type', ref: 'e1', text: '{{message}}', text_parameterized: true, parameter_name: 'message' },
+    ],
+  });
+
+  const calls = [];
+  const result = await memory.replayAgentHistory('example.com', 'parameterized_search_message', {
+    navigate: async (step) => { calls.push(['navigate', step.url]); return { ok: true }; },
+    type: async (step) => { calls.push(['type', step.text]); return { ok: true }; },
+  }, { parameters: { query: 'jobs' } });
+
+  expect(result).toMatchObject({ ok: false, llm_used: false, requires_parameters: ['location', 'message'] });
+  expect(calls).toEqual([]);
+});
+
+test('replay substitutes query location and message runtime placeholders together', async () => {
+  await memory.persistAgentHistorySteps({
+    siteKey: 'example.com',
+    actionKey: 'parameterized_search_message',
+    steps: [
+      { kind: 'navigate', url: 'https://example.com/search?q={{query}}&near={{location}}' },
+      { kind: 'type', ref: 'e1', text: '{{message}}', text_parameterized: true, parameter_name: 'message' },
+    ],
+  });
+
+  const calls = [];
+  const result = await memory.replayAgentHistory('example.com', 'parameterized_search_message', {
+    navigate: async (step) => { calls.push(['navigate', step.url]); return { ok: true }; },
+    type: async (step) => { calls.push(['type', step.text]); return { ok: true }; },
+  }, { parameters: { query: 'jobs', location: 'Lyon', message: 'Hello' } });
+
+  expect(result.ok).toBe(true);
+  expect(calls).toEqual([
+    ['navigate', 'https://example.com/search?q=jobs&near=Lyon'],
+    ['type', 'Hello'],
+  ]);
+});
+
+test('records side-effect-level metadata for common action classes', async () => {
+  const levels = ['read_only', 'message_send', 'submit_apply', 'buy_pay', 'delete', 'publish', 'account_setting'];
+  for (const level of levels) {
+    const saved = await memory.persistAgentHistorySteps({
+      siteKey: 'example.com',
+      actionKey: `flow_${level}`,
+      steps: [{ kind: 'click', ref: level, side_effect_level: level }],
+      side_effect_level: level,
+    });
+    expect(saved.payload.hermes_meta.side_effect_level).toBe(level);
+    expect(saved.payload.hermes_meta.derived_flow.steps[0].side_effect_level).toBe(level);
+  }
+});
+
+test('persists profile-scoped AgentHistory flows with managed-browser metadata', async () => {
+  const tabState = memory.createMemoryTabState();
+  await memory.recordSuccessfulBrowserAction(tabState, {
+    kind: 'navigate',
+    url: 'https://example.com/dashboard',
+    result: { ok: true, url: 'https://example.com/dashboard', title: 'Dashboard' },
+  });
+
+  const saved = await memory.recordFlow(tabState, 'example.com', 'open_dashboard', {
+    profile: 'Buyer Profile',
+    owner_cli: 'resell-cli',
+    domain: 'resale',
+    side_effect_level: 'read_only',
+    safe_to_share: false,
+    created_by: 'managed-browser-cli',
+    parameters: { query: '{{query}}' },
+  });
+
+  expect(saved.path).toBe(path.join(tmpDir, 'profiles', 'buyer_profile', 'example.com', 'open_dashboard.AgentHistory.json'));
+  const payload = JSON.parse(await readFile(saved.path, 'utf8'));
+  expect(payload.hermes_meta).toMatchObject({
+    profile: 'buyer_profile',
+    owner_cli: 'resell-cli',
+    domain: 'resale',
+    side_effect_level: 'read_only',
+    safe_to_share: false,
+    created_by: 'managed-browser-cli',
+    parameters: { query: '{{query}}' },
+  });
+});
+
+test('loads profile-specific AgentHistory before shared safe templates', async () => {
+  const sharedState = memory.createMemoryTabState();
+  await memory.recordSuccessfulBrowserAction(sharedState, {
+    kind: 'navigate',
+    url: 'https://example.com/shared',
+    result: { ok: true, url: 'https://example.com/shared' },
+  });
+  await memory.recordFlow(sharedState, 'example.com', 'open_dashboard', { safe_to_share: true });
+
+  const profileState = memory.createMemoryTabState();
+  await memory.recordSuccessfulBrowserAction(profileState, {
+    kind: 'navigate',
+    url: 'https://example.com/profile-specific',
+    result: { ok: true, url: 'https://example.com/profile-specific' },
+  });
+  await memory.recordFlow(profileState, 'example.com', 'open_dashboard', { profile: 'buyer' });
+
+  const loaded = await memory.loadAgentHistory('example.com', 'open_dashboard', { profile: 'buyer' });
+
+  expect(loaded.path).toBe(path.join(tmpDir, 'profiles', 'buyer', 'example.com', 'open_dashboard.AgentHistory.json'));
+  expect(loaded.payload.hermes_meta.derived_flow.steps[0].url).toBe('https://example.com/profile-specific');
+});
+
+test('falls back from profile lookup only to shared flows explicitly marked safe_to_share', async () => {
+  const unsafeState = memory.createMemoryTabState();
+  await memory.recordSuccessfulBrowserAction(unsafeState, {
+    kind: 'navigate',
+    url: 'https://example.com/private-template',
+    result: { ok: true, url: 'https://example.com/private-template' },
+  });
+  await memory.recordFlow(unsafeState, 'example.com', 'private_action');
+
+  await expect(memory.loadAgentHistory('example.com', 'private_action', { profile: 'seller' }))
+    .rejects.toThrow('not marked safe_to_share');
+
+  const sharedState = memory.createMemoryTabState();
+  await memory.recordSuccessfulBrowserAction(sharedState, {
+    kind: 'navigate',
+    url: 'https://example.com/shared-template',
+    result: { ok: true, url: 'https://example.com/shared-template' },
+  });
+  await memory.recordFlow(sharedState, 'example.com', 'shared_action', { safe_to_share: true });
+
+  const loaded = await memory.loadAgentHistory('example.com', 'shared_action', { profile: 'seller' });
+  expect(loaded.path).toBe(path.join(tmpDir, 'example.com', 'shared_action.AgentHistory.json'));
+  expect(loaded.payload.hermes_meta.safe_to_share).toBe(true);
+});
+
+test('profile lookup never falls through to another profile-specific learned flow', async () => {
+  const sellerState = memory.createMemoryTabState();
+  await memory.recordSuccessfulBrowserAction(sellerState, {
+    kind: 'navigate',
+    url: 'https://example.com/seller-private',
+    result: { ok: true, url: 'https://example.com/seller-private' },
+  });
+  await memory.recordFlow(sellerState, 'example.com', 'private_action', { profile: 'seller' });
+
+  await expect(memory.loadAgentHistory('example.com', 'private_action', { profile: 'buyer' }))
+    .rejects.toThrow('No AgentHistory flow');
 });
 
 test('managed non-Leboncoin site keys record, search, replay, and delete independently', async () => {

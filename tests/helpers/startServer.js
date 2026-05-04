@@ -28,9 +28,10 @@ async function startServer(port = 0, extraEnv = {}) {
   const cfg = loadConfig();
   const pluginDir = path.join(__dirname, '../..');
 
+  const debugServer = extraEnv.DEBUG_SERVER ?? cfg.serverEnv.DEBUG_SERVER;
   const log = {
-    info: (msg) => { if (cfg.serverEnv.DEBUG_SERVER) console.log(msg); },
-    error: (msg) => { if (cfg.serverEnv.DEBUG_SERVER) console.error(msg); },
+    info: (msg) => { if (debugServer) console.log(msg); },
+    error: (msg) => { if (debugServer) console.error(msg); },
   };
 
   serverProcess = launchServer({

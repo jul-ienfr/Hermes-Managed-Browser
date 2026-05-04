@@ -25,15 +25,33 @@ export function resolveVncConfig(pluginConfig = {}) {
   const viewOnly = process.env.VIEW_ONLY === '1' || pluginConfig.viewOnly === true;
   const vncPort = process.env.VNC_PORT || pluginConfig.vncPort || '5900';
   const novncPort = process.env.NOVNC_PORT || pluginConfig.novncPort || '6080';
+  const humanOnly = process.env.CAMOFOX_VNC_HUMAN_ONLY === '0' ? false : pluginConfig.humanOnly !== false;
+  const managedRegistryOnly = process.env.CAMOFOX_VNC_MANAGED_REGISTRY_ONLY === '0' ? false : pluginConfig.managedRegistryOnly !== false;
+  const bind = humanOnly ? (pluginConfig.bind || '127.0.0.1') : (process.env.VNC_BIND || pluginConfig.bind || '127.0.0.1');
+  const displayRegistry = process.env.CAMOFOX_VNC_DISPLAY_REGISTRY || pluginConfig.displayRegistry || '';
+  const displaySelection = process.env.CAMOFOX_VNC_DISPLAY_SELECTION || pluginConfig.displaySelection || '';
 
-  return { enabled, resolution, vncPassword, viewOnly, vncPort, novncPort };
+  return { enabled, resolution, vncPassword, viewOnly, vncPort, novncPort, bind, humanOnly, managedRegistryOnly, displayRegistry, displaySelection };
 }
 
 /**
  * Start the vnc-watcher.sh child process.
  * Returns the spawned ChildProcess.
  */
-export function startWatcher({ resolution, vncPassword, viewOnly, vncPort, novncPort, log, events }) {
+export function startWatcher({
+  resolution,
+  vncPassword,
+  viewOnly,
+  vncPort,
+  novncPort,
+  bind,
+  humanOnly,
+  managedRegistryOnly,
+  displayRegistry,
+  displaySelection,
+  log,
+  events,
+}) {
   const watcherPath = path.join(__dirname, 'vnc-watcher.sh');
   const watcher = spawn('sh', [watcherPath], {
     env: {
@@ -43,6 +61,11 @@ export function startWatcher({ resolution, vncPassword, viewOnly, vncPort, novnc
       VIEW_ONLY: viewOnly ? '1' : '0',
       VNC_PORT: String(vncPort),
       NOVNC_PORT: String(novncPort),
+      VNC_BIND: bind || '127.0.0.1',
+      CAMOFOX_VNC_HUMAN_ONLY: humanOnly ? '1' : '0',
+      CAMOFOX_VNC_MANAGED_REGISTRY_ONLY: managedRegistryOnly ? '1' : '0',
+      CAMOFOX_VNC_DISPLAY_REGISTRY: displayRegistry || process.env.CAMOFOX_VNC_DISPLAY_REGISTRY || '',
+      CAMOFOX_VNC_DISPLAY_SELECTION: displaySelection || process.env.CAMOFOX_VNC_DISPLAY_SELECTION || '',
     },
     stdio: ['ignore', 'inherit', 'inherit'],
     detached: false,

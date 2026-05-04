@@ -45,9 +45,19 @@
 
 import { resolveVncConfig, startWatcher } from './vnc-launcher.js';
 import { requireAuth } from '../../lib/auth.js';
+import { registerVncProfileRoutes } from '../../lib/vnc-profile-routes.js';
+
+function isPrivateLanAddress(address) {
+  const normalized = String(address || '').replace(/^::ffff:/, '');
+  if (normalized === '127.0.0.1' || normalized === '::1') return true;
+  if (normalized.startsWith('10.')) return true;
+  if (normalized.startsWith('192.168.')) return true;
+  const match = normalized.match(/^172\.(\d+)\./);
+  return Boolean(match && Number(match[1]) >= 16 && Number(match[1]) <= 31);
+}
 
 export async function register(app, ctx, pluginConfig = {}) {
-  const { events, config, log, sessions, VirtualDisplay, safeError } = ctx;
+  const { events, config, log, sessions, VirtualDisplay, safeError, destroySession } = ctx;
 
   // Resolve all config (env vars + pluginConfig) via the launcher module
   const vncConfig = resolveVncConfig(pluginConfig);
@@ -61,19 +71,24 @@ export async function register(app, ctx, pluginConfig = {}) {
   const { resolution } = vncConfig;
 
   class VncVirtualDisplay extends VirtualDisplay {
+    constructor(options = {}) {
+      super();
+      this.profileResolution = options?.resolution || resolution;
+    }
+
     get xvfb_args() {
       const args = super.xvfb_args;
       const idx = args.indexOf('0');
       if (idx > 0 && args[idx - 1] === '-screen') {
         const patched = [...args];
-        patched[idx + 1] = resolution;
+        patched[idx + 1] = this.profileResolution;
         return patched;
       }
       return args;
     }
   }
 
-  ctx.createVirtualDisplay = () => new VncVirtualDisplay();
+  ctx.createVirtualDisplay = (options = {}) => new VncVirtualDisplay(options);
   log('info', 'vnc plugin: overriding Xvfb resolution', { resolution });
 
   // --- VNC watcher process ---
@@ -91,6 +106,11 @@ export async function register(app, ctx, pluginConfig = {}) {
     viewOnly: vncConfig.viewOnly,
     vncPort: vncConfig.vncPort,
     novncPort: vncConfig.novncPort,
+    bind: vncConfig.bind,
+    humanOnly: vncConfig.humanOnly,
+    managedRegistryOnly: vncConfig.managedRegistryOnly,
+    displayRegistry: vncConfig.displayRegistry,
+    displaySelection: vncConfig.displaySelection,
     log,
     events,
   });
@@ -105,6 +125,30 @@ export async function register(app, ctx, pluginConfig = {}) {
 
   // --- HTTP endpoint: GET /sessions/:userId/storage_state ---
   const authMiddleware = requireAuth(config);
+  const humanVncAuthMiddleware = (req, res, next) => {
+    if (vncConfig.humanOnly && isPrivateLanAddress(req.socket?.remoteAddress)) {
+      return next();
+    }
+    return authMiddleware(req, res, next);
+  };
+
+  registerVncProfileRoutes(app, {
+    authMiddleware: humanVncAuthMiddleware,
+    registryPath: vncConfig.displayRegistry,
+    selectionPath: vncConfig.displaySelection,
+    safeError,
+    closeProfile: async (userId) => {
+      const key = String(userId);
+      const session = sessions.get(key);
+      if (session && destroySession) destroySession(key);
+      return { closed: Boolean(session), userId: key };
+    },
+    getNovncUrl: (req) => {
+      const protocol = req.protocol || 'http';
+      const hostname = req.hostname || String(req.headers.host || '').split(':')[0] || '127.0.0.1';
+      return `${protocol}://${hostname}:${vncConfig.novncPort}/vnc.html?autoconnect=true&resize=scale&path=websockify`;
+    },
+  });
 
   app.get('/sessions/:userId/storage_state', authMiddleware, async (req, res) => {
     try {

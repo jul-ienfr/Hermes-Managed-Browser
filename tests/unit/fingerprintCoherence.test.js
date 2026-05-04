@@ -30,6 +30,31 @@ describe('fingerprint coherence', () => {
     ]));
   });
 
+  test('flags deeper managed browser fingerprint mismatches observed on anti-bot diagnostics', () => {
+    const result = validateFingerprintCoherence({
+      expected: {
+        locale: 'fr-FR',
+        languages: ['fr-FR', 'fr', 'en-US', 'en'],
+        screen: { width: 1600, height: 900 },
+        viewport: { width: 1600, height: 900 },
+        webgl: { vendor: 'Intel', renderer: 'Intel(R) HD Graphics, or similar' },
+        doNotTrack: '0',
+      },
+      observed: {
+        languages: ['fr-FR'],
+        screen: { width: 2560, height: 1440 },
+        viewport: { width: 1292, height: 1345 },
+        webgl: { vendor: 'Google Inc. (NVIDIA)', renderer: 'ANGLE (NVIDIA, NVIDIA GeForce GTX 980 Direct3D11 vs_5_0 ps_5_0), or similar' },
+        doNotTrack: '1',
+      },
+    });
+
+    expect(result.ok).toBe(false);
+    expect(result.issues.map((issue) => issue.key)).toEqual(expect.arrayContaining([
+      'viewport_mismatch', 'screen_mismatch', 'webgl_mismatch', 'donottrack_mismatch',
+    ]));
+  });
+
   test('redacts cookies authorization and challenge payloads from diagnostics', () => {
     const redacted = redactFingerprintDiagnostics({
       headers: { cookie: 'sid=secret', authorization: 'Bearer secret', accept: 'text/html' },
@@ -60,7 +85,7 @@ describe('fingerprint coherence', () => {
 
     const snapshot = await collectBrowserFingerprintSnapshot(page);
 
-    expect(snapshot.viewport).toEqual({ width: 1440, height: 900 });
+    expect(snapshot.playwrightViewport).toEqual({ width: 1440, height: 900 });
     expect(snapshot.webdriver).toBeDefined();
     expect(snapshot.languages).toBeDefined();
   });

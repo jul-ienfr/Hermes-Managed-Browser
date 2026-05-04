@@ -1339,7 +1339,7 @@ Expected: PASS.
 Recommended command shape:
 
 ```bash
-node scripts/managed-browser.js fingerprint --profile leboncoin-ju --site leboncoin --url https://www.leboncoin.fr
+node scripts/managed-browser.js fingerprint --profile leboncoin-cim --site leboncoin --url https://www.leboncoin.fr
 ```
 
 Output shape:

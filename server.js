@@ -3,8 +3,11 @@ import { VirtualDisplay } from 'camoufox-js/dist/virtdisplay.js';
 import { firefox } from 'playwright-core';
 import express from 'express';
 import crypto from 'crypto';
+import fs from 'fs';
 import os from 'os';
 import path from 'node:path';
+import { execFile } from 'node:child_process';
+import { promisify } from 'node:util';
 import { resolveVncConfig } from './plugins/vnc/vnc-launcher.js';
 import { expandMacro } from './lib/macros.js';
 import { loadConfig } from './lib/config.js';
@@ -12,7 +15,7 @@ import { normalizePlaywrightProxy, createProxyPool, buildProxyUrl } from './lib/
 import { createFlyHelpers } from './lib/fly.js';
 import { createPluginEvents, loadPlugins, readPluginConfig } from './lib/plugins.js';
 import { requireAuth, timingSafeCompare as _timingSafeCompare, isLoopbackAddress as _isLoopbackAddress } from './lib/auth.js';
-import { windowSnapshot, compactSnapshot } from './lib/snapshot.js';
+import { windowSnapshot, compactSnapshot, buildDomMetadata } from './lib/snapshot.js';
 import {
   MAX_DOWNLOAD_INLINE_BYTES,
   clearTabDownloads,
@@ -36,13 +39,17 @@ import {
   recordRecoveryAction,
 } from './lib/managed-recovery-registry.js';
 import {
+  applyLearnedDomRepair,
   deleteFlow as deleteAgentHistoryFlow,
   loadAgentHistory,
-  persistAgentHistorySteps,
   recordFlow as recordAgentHistoryFlow,
   recordSuccessfulBrowserAction,
   searchFlows,
 } from './lib/agent-history-memory.js';
+import {
+  seedSharedManagedFlows,
+  sharedManagedFlowAvailability,
+} from './lib/shared-managed-flows.js';
 
 import {
   initMetrics, getRegister, isMetricsEnabled, createMetric,
@@ -53,22 +60,57 @@ import { cleanupOrphanedTempFiles } from './lib/tmp-cleanup.js';
 import { coalesceInflight } from './lib/inflight.js';
 import {
   loadPersistedBrowserProfile,
+  loadPersistedFingerprint,
+  loadPersistedProfilePolicy,
   persistBrowserProfile,
+  persistFingerprint,
+  persistProfilePolicy,
 } from './lib/persistence.js';
-import { listManagedBrowserProfiles } from './lib/managed-browser-policy.js';
+import {
+  buildCamoufoxLaunchOptionsInput,
+  expectedFingerprintFromLaunchProfile,
+  generateCanonicalFingerprint,
+} from './lib/camoufox-launch-profile.js';
+import {
+  detectSensitivePolicyChange,
+  profilePolicyFromLaunchProfile,
+} from './lib/managed-profile-policy.js';
+import { collectBrowserFingerprintSnapshot, validateFingerprintCoherence } from './lib/fingerprint-coherence.js';
+import { validateVncGeometry } from './lib/vnc-geometry-doctor.js';
+import {
+  listManagedBrowserProfileIdentities,
+  managedBrowserProfileStatus,
+  requireManagedBrowserProfileIdentity,
+} from './lib/managed-browser-policy.js';
+import {
+  ProfileLeaseManager,
+  enforceManagedLease,
+  ensureManagedLease,
+  managedReadAllowed,
+  serializeProfileLeaseError,
+} from './lib/profile-lease-manager.js';
+import { managedCliErrorFields, normalizeManagedCliResult, normalizeManagedNotificationResponse } from './lib/managed-cli-schema.js';
+import { ensureNotificationCaptureOnPage, installNotificationCapture } from './lib/notification-capture.js';
+import { listNotifications, markNotificationsRead, recordNotification } from './lib/managed-notifications.js';
 import { buildBrowserPersona } from './lib/browser-persona.js';
 import { buildHumanBehaviorPersona } from './lib/human-behavior-persona.js';
 import { resolveBrowserDisplayMode } from './lib/browser-display-mode.js';
-import { recordVncDisplay, removeVncDisplay, readSelectedVncUserId } from './lib/vnc-display-registry.js';
+import { recordVncDisplay, removeVncDisplay, readDisplayRegistry, readSelectedVncUserId } from './lib/vnc-display-registry.js';
 import { shouldStartKeepalive } from './lib/keepalive-policy.js';
 import { humanClick, humanType, humanPress, humanScroll, humanPrepareTarget, humanMove } from './lib/human-actions.js';
 import { createHumanSessionState, getHumanCursor, updateHumanCursor } from './lib/human-session-state.js';
+import { managedAuthEnsure, managedAuthStatus } from './lib/managed-auth.js';
+import { credentialPath } from './lib/credentials-vault.js';
+import { getLifecycleDefault, normalizeLifecycleClosePolicy, setLifecycleDefault } from './lib/managed-lifecycle-policy-store.js';
+import { enforceProfileWindowBounds, managedProfileDisplayResolution, withManagedProfileLaunchArgs } from './lib/managed-browser-display-size.js';
 
 const CONFIG = loadConfig();
 const PLUGIN_CONFIGS = readPluginConfig().configs;
 const VNC_HEALTH_INFO = resolveVncConfig(PLUGIN_CONFIGS.get('vnc') || {});
-const MANAGED_BROWSER_PROFILES = listManagedBrowserProfiles();
+const MANAGED_BROWSER_PROFILES = listManagedBrowserProfileIdentities();
 const MANAGED_BROWSER_PROFILES_BY_USER_ID = new Map(MANAGED_BROWSER_PROFILES.map((policy) => [policy.userId, policy]));
+const managedProfileLeases = new ProfileLeaseManager({ ttlMs: CONFIG.managedProfileLeaseTtlMs });
+const execFileAsync = promisify(execFile);
 
 function getVncHealthFields(req) {
   if (!VNC_HEALTH_INFO.enabled) return {};
@@ -206,7 +248,13 @@ function safeError(err) {
 // Send error response with appropriate status code (422 for stale refs, 500 otherwise)
 function sendError(res, err, extraFields = {}) {
   const status = err instanceof StaleRefsError ? 422 : (err.statusCode || 500);
+  if (err?.code === 'profile_locked') {
+    res.status(status).json({ ...serializeProfileLeaseError(err), ...extraFields });
+    return;
+  }
   const body = { error: safeError(err), ...extraFields };
+  if (err?.code) body.code = err.code;
+  if (err?.issues) body.issues = err.issues;
   if (err instanceof StaleRefsError) {
     body.code = 'stale_refs';
     body.ref = err.ref;
@@ -318,6 +366,7 @@ const browsers = new Map();
 // Note: sessionKey was previously called listItemId - both are accepted for backward compatibility
 const sessions = new Map();
 const managedRecoveryRegistry = createManagedRecoveryRegistry();
+const disabledNotificationCaptureOrigins = new Set();
 const BROWSER_PROFILE_DIR = process.env.CAMOFOX_PROFILE_DIR || path.join(os.homedir(), '.camofox', 'profiles');
 const KEEPALIVE_USER_ID = process.env.CAMOFOX_KEEPALIVE_USER_ID || '';
 const KEEPALIVE_SESSION_KEY = process.env.CAMOFOX_KEEPALIVE_SESSION_KEY || 'manual-login';
@@ -563,6 +612,7 @@ function getBrowserEntry(userId) {
       virtualDisplay: null,
       launchProxy: null,
       persona: null,
+      display: null,
     };
     browsers.set(key, entry);
   }
@@ -714,11 +764,29 @@ function resolveProfileRoot(profileDir) {
 
 async function resolveLaunchProfile(userId, { profileDir } = {}) {
   const profileRoot = resolveProfileRoot(profileDir);
+  const vncBounds = VNC_HEALTH_INFO.resolution || '1920x1080';
   const persisted = await loadPersistedBrowserProfile(profileRoot, userId, { warn: (msg, fields) => log('warn', msg, fields) });
   if (persisted?.launchConstraints && persisted?.contextDefaults) {
-    return persisted;
+    const bounded = enforceProfileWindowBounds(persisted, { userId, vncBounds });
+    const persistedSize = persisted.contextDefaults?.viewport;
+    const boundedSize = bounded.contextDefaults?.viewport;
+    if (bounded !== persisted && (
+      persistedSize?.width !== boundedSize?.width ||
+      persistedSize?.height !== boundedSize?.height ||
+      persisted.contextDefaults?.deviceScaleFactor !== bounded.contextDefaults?.deviceScaleFactor ||
+      persisted.managedDisplayPolicy?.invariant !== bounded.managedDisplayPolicy?.invariant
+    )) {
+      await persistBrowserProfile({
+        profileDir: profileRoot,
+        userId,
+        profile: bounded,
+        logger: { warn: (msg, fields) => log('warn', msg, fields) },
+      });
+      log('info', 'managed profile display size enforced', { userId: String(userId), viewport: boundedSize, vncBounds });
+    }
+    return bounded;
   }
-  const profile = createPersistedLaunchProfile(userId);
+  const profile = enforceProfileWindowBounds(createPersistedLaunchProfile(userId), { userId, vncBounds });
   await persistBrowserProfile({
     profileDir: profileRoot,
     userId,
@@ -810,6 +878,68 @@ async function launchBrowserInstance(userId, { profileDir } = {}) {
   const entry = getBrowserEntry(userId);
   const profileRoot = resolveProfileRoot(profileDir);
   const launchProfile = await resolveLaunchProfile(userId, { profileDir: profileRoot });
+  const profilePolicy = profilePolicyFromLaunchProfile(userId, launchProfile);
+  const previousProfilePolicy = await loadPersistedProfilePolicy(profileRoot, userId, { warn: (msg, fields) => log('warn', msg, fields) });
+  const policyIssues = detectSensitivePolicyChange(previousProfilePolicy, profilePolicy);
+  const persistedFingerprint = await loadPersistedFingerprint(profileRoot, userId, { warn: (msg, fields) => log('warn', msg, fields) });
+  if (policyIssues.length && persistedFingerprint?.fingerprint) {
+    const err = new Error(`Managed profile policy changed for ${userId}; clone/reset profile before rotating fingerprint-sensitive fields: ${policyIssues.join(', ')}`);
+    err.code = 'managed_profile_policy_changed';
+    err.statusCode = 409;
+    err.issues = policyIssues;
+    throw err;
+  }
+  await persistProfilePolicy({ profileDir: profileRoot, userId, policy: profilePolicy, logger: { warn: (msg, fields) => log('warn', msg, fields) } });
+  if (persistedFingerprint?.fingerprint) {
+    // Validate persisted fingerprint screen matches persona
+    // (existing profiles may have stale fingerprints from the generateCanonicalFingerprint
+    //  fallback bug that dropped the screen constraint)
+    const persona = launchProfile.persona || {};
+    const constraints = launchProfile.launchConstraints || {};
+    const rawExpected = constraints.screen !== undefined && constraints.screen !== null && constraints.screen !== ''
+      ? constraints.screen
+      : (persona.screen !== undefined && persona.screen !== null && persona.screen !== '' ? persona.screen : undefined);
+    const fpScreen = persistedFingerprint.fingerprint?.screen;
+    if (rawExpected && fpScreen && Number.isFinite(fpScreen.width) && Number.isFinite(fpScreen.height)) {
+      const expW = rawExpected.minWidth ?? rawExpected.width;
+      const expH = rawExpected.minHeight ?? rawExpected.height;
+      // Use proportional threshold: >20% mismatch in either dimension triggers regen.
+      // This catches the pre-fix bug (default BrowserForge 1280×720 vs persona 1600×900 = 20% diff)
+      // without false-looping on BrowserForge's closest-match (1707×960 vs 1600×900 = 6.7%).
+      const mismatch = Number.isFinite(expW) && Number.isFinite(expH) && expW > 0 && expH > 0
+        && (Math.abs(fpScreen.width - expW) / expW > 0.20
+         || Math.abs(fpScreen.height - expH) / expH > 0.20);
+      if (mismatch) {
+        log('warn', 'persisted fingerprint screen mismatch — will regenerate', {
+          expected: { width: expW, height: expH },
+          actual: { width: fpScreen.width, height: fpScreen.height },
+          profileRoot,
+        });
+        // Remove stale fingerprint files so it gets regenerated
+        const { fingerprintPath, fingerprintMetaPath } = persistedFingerprint;
+        await fs.promises.unlink(fingerprintPath).catch(() => {});
+        await fs.promises.unlink(fingerprintMetaPath).catch(() => {});
+        persistedFingerprint = undefined;
+      }
+    }
+  }
+  if (persistedFingerprint?.fingerprint) {
+    launchProfile.persistedFingerprint = persistedFingerprint.fingerprint;
+  } else {
+    const fingerprint = generateCanonicalFingerprint(launchProfile);
+    await persistFingerprint({
+      profileDir: profileRoot,
+      userId,
+      fingerprint,
+      metadata: {
+        source: 'camoufox-js',
+        persistedFrom: 'pre-launch-generateFingerprint',
+        profilePolicyVersion: launchProfile.persona?.version || null,
+      },
+      logger: { warn: (msg, fields) => log('warn', msg, fields) },
+    });
+    launchProfile.persistedFingerprint = fingerprint;
+  }
   const maxAttempts = proxyPool?.launchRetries ?? 1;
   let lastError = null;
 
@@ -829,7 +959,7 @@ async function launchBrowserInstance(userId, { profileDir } = {}) {
         userId: entry.key,
         sharedDisplay: CONFIG.sharedDisplay,
         sharedDisplayUserIds: CONFIG.sharedDisplayUserIds,
-        createVirtualDisplay: () => pluginCtx.createVirtualDisplay(),
+        createVirtualDisplay: () => pluginCtx.createVirtualDisplay({ resolution: managedProfileDisplayResolution(launchProfile) }),
       });
       localVirtualDisplay = displayMode.virtualDisplay;
       vdDisplay = displayMode.display;
@@ -861,21 +991,19 @@ async function launchBrowserInstance(userId, { profileDir } = {}) {
     });
 
     try {
-      const options = await launchOptions({
+      const camoufoxInput = buildCamoufoxLaunchOptionsInput(launchProfile, {
         headless: displayMode?.headless ?? (useVirtualDisplay ? false : true),
-        os: launchProfile.launchConstraints.os,
-        locale: launchProfile.launchConstraints.locale,
-        screen: launchProfile.launchConstraints.screen,
-        window: launchProfile.launchConstraints.window,
-        webgl_config: launchProfile.launchConstraints.webglConfig,
         humanize: true,
-        enable_cache: true,
-        firefox_user_prefs: launchProfile.firefoxUserPrefs,
         proxy: launchProxy,
         geoip: !!launchProxy,
-        virtual_display: vdDisplay,
+        virtualDisplay: vdDisplay,
+      });
+      let options = await launchOptions({
+        ...camoufoxInput,
+        enable_cache: true,
       });
       options.proxy = normalizePlaywrightProxy(options.proxy);
+      options = withManagedProfileLaunchArgs(options, launchProfile);
       await pluginEvents.emitAsync('browser:launching', { options });
 
       if (displayMode?.usesSharedDisplay) {
@@ -918,7 +1046,12 @@ async function launchBrowserInstance(userId, { profileDir } = {}) {
       entry.persona = launchProfile;
       entry.profileDir = profileRoot;
       entry.browser = candidateBrowser;
-      if (vdDisplay) recordVncDisplay({ userId: entry.key, display: vdDisplay });
+      if (vdDisplay) recordVncDisplay({
+        userId: entry.key,
+        display: vdDisplay,
+        resolution: managedProfileDisplayResolution(launchProfile),
+        profileWindowSize: launchProfile?.managedDisplayPolicy?.profileWindowSize || launchProfile?.persona?.screen || null,
+      });
       attachBrowserCleanup(entry, entry.browser, localVirtualDisplay);
       pluginEvents.emit('browser:launched', { browser: entry.browser, display: vdDisplay, userId: entry.key, persona: launchProfile.persona });
 
@@ -931,7 +1064,7 @@ async function launchBrowserInstance(userId, { profileDir } = {}) {
         proxyServer: launchProxy?.server || null,
         proxySession: launchProxy?.sessionId || null,
       });
-      return { browser: entry.browser, launchProxy, persona: launchProfile };
+      return { browser: entry.browser, launchProxy, persona: launchProfile, display: vdDisplay || null };
     } catch (err) {
       lastError = err;
       log('warn', 'camoufox launch attempt failed', {
@@ -981,7 +1114,7 @@ async function ensureBrowser(userId = 'default', { profileDir } = {}) {
     entry.launchProxy = null;
     entry.browser = null;
   }
-  if (entry.browser) return { browser: entry.browser, launchProxy: entry.launchProxy, persona: entry.persona };
+  if (entry.browser) return { browser: entry.browser, launchProxy: entry.launchProxy, persona: entry.persona, display: entry.display };
   if (entry.launchPromise) return entry.launchPromise;
   const launchTimeoutMs = proxyPool?.launchTimeoutMs ?? 60000;
   entry.launchPromise = Promise.race([
@@ -1091,7 +1224,7 @@ async function getSession(userId, { profileDir } = {}) {
       if (sessions.size >= MAX_SESSIONS) {
         throw new Error('Maximum concurrent sessions reached');
       }
-      const { browser: b, launchProxy: launchBrowserProxy, persona: launchPersona } = await ensureBrowser(key, { profileDir: profileRoot });
+      const { browser: b, launchProxy: launchBrowserProxy, persona: launchPersona, display: browserDisplay } = await ensureBrowser(key, { profileDir: profileRoot });
       const contextOptions = {
         viewport: launchPersona?.contextDefaults?.viewport || { width: 1280, height: 720 },
         permissions: ['geolocation'],
@@ -1120,12 +1253,31 @@ async function getSession(userId, { profileDir } = {}) {
       }
       await pluginEvents.emitAsync('session:creating', { userId: key, contextOptions, profileDir: profileRoot });
       const context = await b.newContext(contextOptions);
+      if (!disabledNotificationCaptureOrigins.has(`${key}:*`)) {
+        await installNotificationCapture(context, {
+          profile: key,
+          site: 'managed',
+          origin: '',
+          onNotification: (notification) => {
+            try {
+              recordNotification({
+                storagePath: path.join(profileRoot, key, 'notifications.jsonl'),
+                recorded_at: new Date().toISOString(),
+                ...notification,
+              });
+            } catch (err) {
+              log('warn', 'notification capture record failed', { userId: key, error: err.message });
+            }
+          },
+        }).catch((err) => log('warn', 'notification capture install failed', { userId: key, error: err.message }));
+      }
       
       const created = {
         context,
         tabGroups: new Map(),
         profileDir: profileRoot,
         launchPersona,
+        display: browserDisplay || null,
         lastAccess: Date.now(),
         proxySessionId: sessionProxy?.sessionId || null,
         browserProxySessionId: launchBrowserProxy?.sessionId || null,
@@ -1407,18 +1559,71 @@ function createTabState(page, options = {}) {
   return tabState;
 }
 
-async function sizeVisibleManagedPage(page, session, reqId) {
+async function fitVisibleWindowToVncDisplay(page, session, reqId) {
   const viewport = session.launchPersona?.contextDefaults?.viewport || session.launchPersona?.persona?.viewport;
   if (!viewport?.width || !viewport?.height) return null;
+  const width = Number.parseInt(String(viewport.width), 10);
+  const height = Number.parseInt(String(viewport.height), 10);
+  if (!Number.isFinite(width) || !Number.isFinite(height)) return null;
   try {
-    await page.setViewportSize({ width: viewport.width, height: viewport.height });
-    await page.evaluate(({ width, height }) => {
-      try { window.moveTo(0, 0); } catch {}
-      try { window.resizeTo(width, height); } catch {}
-    }, { width: viewport.width, height: viewport.height });
-    return viewport;
+    const measuredBefore = await page.evaluate(() => {
+      try {
+        return { innerWidth, innerHeight, outerWidth, outerHeight, screenW: screen.width, screenH: screen.height };
+      } catch {
+        return null;
+      }
+    });
+
+    let x11WindowId = null;
+    if (session.display && process.platform === 'linux') {
+      try {
+        for (let attempt = 0; attempt < 8; attempt += 1) {
+          const { stdout } = await execFileAsync('xdotool', ['search', '--name', 'Camoufox'], {
+            env: { ...process.env, DISPLAY: session.display },
+            timeout: 3000,
+            maxBuffer: 4096,
+          });
+          x11WindowId = stdout.trim().split(/\s+/).filter(Boolean).pop() || null;
+          if (x11WindowId) {
+            const before = await execFileAsync('xdotool', ['getwindowgeometry', x11WindowId], {
+              env: { ...process.env, DISPLAY: session.display },
+              timeout: 3000,
+              maxBuffer: 4096,
+            }).catch((err) => ({ stdout: `geometry-error:${err.message}` }));
+            log('info', 'managed visible x11 window found', { reqId, display: session.display, x11WindowId, geometry: before.stdout.trim() });
+            break;
+          }
+          await new Promise((resolve) => setTimeout(resolve, 250));
+        }
+        if (x11WindowId) {
+          await execFileAsync('xdotool', ['windowmove', x11WindowId, '0', '0'], {
+            env: { ...process.env, DISPLAY: session.display },
+            timeout: 3000,
+          });
+          await execFileAsync('xdotool', ['windowsize', x11WindowId, String(width), String(height)], {
+            env: { ...process.env, DISPLAY: session.display },
+            timeout: 3000,
+          });
+        }
+      } catch (err) {
+        log('warn', 'managed visible x11 resize failed', { reqId, display: session.display, error: err.message });
+      }
+    }
+
+    if (!x11WindowId) {
+      await page.setViewportSize({ width, height });
+    }
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    const measured = await page.evaluate(() => {
+      try {
+        return { innerWidth, innerHeight, outerWidth, outerHeight, screenW: screen.width, screenH: screen.height };
+      } catch {
+        return null;
+      }
+    });
+    return { width, height, measured, measuredBefore, x11WindowId, display: session.display || null };
   } catch (err) {
-    log('warn', 'managed visible page resize failed', { reqId, error: err.message, viewport });
+    log('warn', 'managed visible page resize failed', { reqId, error: err.message, viewport: { width, height } });
     return null;
   }
 }
@@ -1439,7 +1644,7 @@ async function createServerOwnedTab(session, {
 }) {
   const group = getTabGroup(session, sessionKey);
   const page = await session.context.newPage();
-  const visibleViewport = eventMetadata.visible ? await sizeVisibleManagedPage(page, session, reqId) : null;
+  const visibleViewport = eventMetadata.visible ? await fitVisibleWindowToVncDisplay(page, session, reqId) : null;
   const tabId = fly.makeTabId();
   const tabState = createTabState(page, {
     userId,
@@ -1914,6 +2119,138 @@ async function extractGoogleSerp(page) {
 
 const REFRESH_READY_TIMEOUT_MS = 2500;
 
+async function extractLiveDomMetadata(page) {
+  if (!page || page.isClosed()) return new Map();
+  const entries = await page.evaluate(({ interactiveRoles, skipPatterns }) => {
+    const safeAttributeNames = new Set([
+      'id',
+      'class',
+      'name',
+      'type',
+      'placeholder',
+      'aria-label',
+      'title',
+      'href',
+      'data-testid',
+      'data-test',
+      'data-cy',
+    ]);
+    const sensitivePattern = /\b(password|passcode|secret|token|api[-_ ]?key|authorization|auth|credential|credit card|card number|cvv|ssn)\b/i;
+    const skipRegexes = skipPatterns.map((source) => new RegExp(source, 'i'));
+    const normalizeTextForKey = (value) => String(value || '').replace(/\s+/g, ' ').trim();
+    const normalizeTag = (value) => String(value || '').trim().toLowerCase().match(/[a-z][a-z0-9-]*/)?.[0] || '';
+    const safeText = (value) => {
+      const text = normalizeTextForKey(value);
+      if (!text || sensitivePattern.test(text)) return '';
+      return text.slice(0, 160);
+    };
+    const attrsFor = (element) => {
+      const attrs = {};
+      for (const attr of Array.from(element?.attributes || [])) {
+        const name = String(attr.name || '').toLowerCase();
+        if (!safeAttributeNames.has(name)) continue;
+        const value = String(attr.value || '');
+        if (sensitivePattern.test(value)) continue;
+        attrs[name] = value.slice(0, 160);
+      }
+      return attrs;
+    };
+    const compact = (object) => Object.fromEntries(Object.entries(object).filter(([, value]) => {
+      if (Array.isArray(value)) return value.length > 0;
+      if (value && typeof value === 'object') return Object.keys(value).length > 0;
+      return value !== undefined && value !== null && value !== '';
+    }));
+    const roleFor = (element) => {
+      const explicit = element.getAttribute('role');
+      if (explicit) return explicit.toLowerCase();
+      const tag = normalizeTag(element.tagName);
+      const type = String(element.getAttribute('type') || '').toLowerCase();
+      if (tag === 'button' || (tag === 'input' && ['button', 'submit', 'reset'].includes(type))) return 'button';
+      if (tag === 'a' && element.getAttribute('href')) return 'link';
+      if (tag === 'textarea') return 'textbox';
+      if (tag === 'input') {
+        if (['checkbox', 'radio'].includes(type)) return type;
+        if (type === 'search') return 'searchbox';
+        if (type === 'range') return 'slider';
+        if (type === 'number') return 'spinbutton';
+        if (type !== 'hidden') return 'textbox';
+      }
+      return '';
+    };
+    const nameFor = (element) => normalizeTextForKey(
+      element.getAttribute('aria-label')
+      || element.getAttribute('title')
+      || element.getAttribute('placeholder')
+      || element.innerText
+      || element.textContent
+      || element.getAttribute('name')
+      || ''
+    );
+    const related = (element, includeText = true) => element ? compact({
+      tag: normalizeTag(element.tagName),
+      text: includeText ? safeText(element.innerText || element.textContent) : undefined,
+      attributes: attrsFor(element),
+    }) : {};
+    const pathFor = (element) => {
+      const path = [];
+      let cursor = element;
+      let guard = 0;
+      while (cursor && guard < 32) {
+        const tag = normalizeTag(cursor.tagName);
+        if (tag) path.unshift(tag);
+        cursor = cursor.parentElement;
+        guard += 1;
+      }
+      return path;
+    };
+    const results = [];
+    const counts = new Map();
+    const selector = 'a[href],button,input:not([type="hidden"]),textarea,[role]';
+    for (const element of Array.from(document.querySelectorAll(selector)).slice(0, 1000)) {
+      if (element.closest('[hidden], [aria-hidden="true"]')) continue;
+      const role = roleFor(element);
+      if (!interactiveRoles.includes(role)) continue;
+      const name = nameFor(element);
+      if (name && skipRegexes.some((regex) => regex.test(name))) continue;
+      const countKey = `${role}:${name}`;
+      const nth = counts.get(countKey) || 0;
+      counts.set(countKey, nth + 1);
+      const path = pathFor(element);
+      const parent = element.parentElement;
+      const siblings = parent ? Array.from(parent.children)
+        .filter((child) => child !== element)
+        .slice(0, 8)
+        .map((child) => related(child, false))
+        .filter((entry) => Object.keys(entry).length > 0) : [];
+      const nearbyText = [
+        element.previousElementSibling?.innerText || element.previousElementSibling?.textContent,
+        element.nextElementSibling?.innerText || element.nextElementSibling?.textContent,
+        parent?.innerText || parent?.textContent,
+      ].map(safeText).filter(Boolean).slice(0, 6);
+      results.push({
+        key: `${role}:${name}:${nth}`,
+        metadata: compact({
+          tag: normalizeTag(element.tagName),
+          text: safeText(element.innerText || element.textContent || name),
+          attributes: attrsFor(element),
+          parent: related(parent),
+          siblings,
+          path,
+          depth: path.length > 0 ? path.length - 1 : undefined,
+          index: parent ? Array.from(parent.children).indexOf(element) : undefined,
+          nearbyText,
+        }),
+      });
+    }
+    return results;
+  }, {
+    interactiveRoles: INTERACTIVE_ROLES,
+    skipPatterns: SKIP_PATTERNS.map((pattern) => pattern.source),
+  }).catch(() => []);
+
+  return new Map((entries || []).map((entry) => [entry.key, entry.metadata || {}]));
+}
+
 async function buildRefs(page) {
   const refs = new Map();
   
@@ -1991,6 +2328,7 @@ async function _buildRefsInner(page, refs, start) {
   
   const lines = ariaYaml.split('\n');
   let refCounter = 1;
+  const liveDomMetadata = await extractLiveDomMetadata(page);
   
   // Track occurrences of each role+name combo for nth disambiguation
   const seenCounts = new Map(); // "role:name" -> count
@@ -2016,7 +2354,15 @@ async function _buildRefsInner(page, refs, start) {
         seenCounts.set(key, nth + 1);
         
         const refId = `e${refCounter++}`;
-        refs.set(refId, { role: normalizedRole, name: normalizedName, nth });
+        refs.set(refId, {
+          role: normalizedRole,
+          name: normalizedName,
+          nth,
+          ...buildDomMetadata({
+            ...(liveDomMetadata.get(key) || {}),
+            index: liveDomMetadata.get(key)?.index ?? nth,
+          }),
+        });
       }
     }
   }
@@ -2171,13 +2517,1117 @@ app.get('/metrics', async (_req, res) => {
   res.send(await reg.metrics());
 });
 
+app.get('/managed/profiles', (_req, res) => {
+  res.json({ ok: true, profiles: listManagedBrowserProfileIdentities() });
+});
+
+app.get('/managed/profiles/:profile/status', (req, res) => {
+  try {
+    const identity = requireManagedBrowserProfileIdentity({ ...req.query, profile: req.params.profile }, { operation: 'profiles.status' });
+    managedReadAllowed({ ...req.query, profile: identity.profile }, managedProfileLeases, {
+      allowLockedRead: CONFIG.managedProfileAllowLockedReads,
+    });
+    const status = managedBrowserProfileStatus({ ...req.query, profile: identity.profile }, {
+      observed: managedObservedState(identity.profile),
+    });
+    const lease = managedProfileLeases.status(status.profile);
+    res.json({ ...status, lease });
+  } catch (err) {
+    handleRouteError(err, req, res);
+  }
+});
+
+app.post('/managed/profiles/ensure', (req, res) => {
+  try {
+    const identity = requireManagedBrowserProfileIdentity(req.body, { operation: 'profiles.ensure' });
+    managedReadAllowed({ ...req.body, profile: identity.profile }, managedProfileLeases, {
+      allowLockedRead: CONFIG.managedProfileAllowLockedReads,
+    });
+    const status = managedBrowserProfileStatus({ ...req.body, profile: identity.profile }, {
+      ensure: true,
+      observed: managedObservedState(identity.profile),
+    });
+    const lease = managedProfileLeases.status(status.profile);
+    res.json({ ...status, lease });
+  } catch (err) {
+    handleRouteError(err, req, res);
+  }
+});
+
+app.post('/managed/profiles/lease/acquire', (req, res) => {
+  try {
+    const identity = requireManagedBrowserProfileIdentity(req.body, { operation: 'profiles.lease.acquire' });
+    const lease = managedProfileLeases.acquire({
+      profile: identity.profile,
+      owner: req.body?.owner || req.body?.owner_cli || req.body?.ownerCli,
+      ttlMs: req.body?.ttl_ms || req.body?.ttlMs,
+    });
+    res.json({ ok: true, profile: identity.profile, ...lease });
+  } catch (err) {
+    handleRouteError(err, req, res);
+  }
+});
+
+app.post('/managed/profiles/lease/renew', (req, res) => {
+  try {
+    const identity = requireManagedBrowserProfileIdentity(req.body, { operation: 'profiles.lease.renew' });
+    const lease = managedProfileLeases.renew({
+      profile: identity.profile,
+      lease_id: req.body?.lease_id || req.body?.leaseId,
+      ttlMs: req.body?.ttl_ms || req.body?.ttlMs,
+    });
+    res.json({ ok: true, profile: identity.profile, ...lease });
+  } catch (err) {
+    handleRouteError(err, req, res);
+  }
+});
+
+app.post('/managed/profiles/lease/release', (req, res) => {
+  try {
+    const identity = requireManagedBrowserProfileIdentity(req.body, { operation: 'profiles.lease.release' });
+    const result = managedProfileLeases.release({
+      profile: identity.profile,
+      lease_id: req.body?.lease_id || req.body?.leaseId,
+    });
+    res.json({ ok: true, profile: identity.profile, ...result });
+  } catch (err) {
+    handleRouteError(err, req, res);
+  }
+});
+
+function managedObservedState(profile) {
+  const policy = MANAGED_BROWSER_PROFILES.find((entry) => entry.profile === profile);
+  if (!policy) return {};
+  const session = sessions.get(policy.userId);
+  const group = session?.tabGroups?.get(policy.sessionKey);
+  const currentTabId = group ? Array.from(group.entries()).find(([, tabState]) => tabState?.page && !tabState.page.isClosed())?.[0] : null;
+  return { currentTabId: currentTabId || null, updatedAt: session?.lastAccess ? new Date(session.lastAccess).toISOString() : null };
+}
+
+function managedCliPayload(identity, body = {}, extra = {}) {
+  return {
+    ...body,
+    profile: identity.profile,
+    userId: identity.userId,
+    sessionKey: identity.sessionKey,
+    profileDir: identity.profileDir,
+    browserPersonaKey: identity.browserPersonaKey,
+    humanPersonaKey: identity.humanPersonaKey,
+    humanProfile: body.humanProfile || identity.defaultHumanProfile,
+    siteKey: body.siteKey || identity.siteKey,
+    ...extra,
+  };
+}
+
+function managedCliLease(input = {}, identity, operation) {
+  return ensureManagedLease({
+    ...input,
+    profile: identity.profile,
+    owner: input.owner || input.owner_cli || input.ownerCli || `managed.cli.${operation}`,
+  }, managedProfileLeases);
+}
+
+async function managedCliHandle(req, res, operation, work, options = {}) {
+  let context = { mode: options.mode || 'browser', llm_used: false };
+  try {
+    const identity = requireManagedBrowserProfileIdentity(req.body, { operation: `managed.cli.${operation}` });
+    context = { ...context, profile: identity.profile, lease_id: req.body?.lease_id || req.body?.leaseId };
+    if (options.write !== false) {
+      const lease = managedCliLease(req.body, identity, operation);
+      context.lease_id = lease.lease_id;
+    } else {
+      managedReadAllowed({ ...req.body, profile: identity.profile }, managedProfileLeases, {
+        allowLockedRead: CONFIG.managedProfileAllowLockedReads,
+      });
+    }
+    const result = await work(identity, context);
+    res.json(normalizeManagedCliResult(operation, result, context));
+  } catch (err) {
+    handleRouteError(err, req, res, managedCliErrorFields(operation, context));
+  }
+}
+
+async function managedCliFindTab(identity, tabId) {
+  const session = sessions.get(normalizeUserId(identity.userId));
+  const found = session && findTab(session, tabId);
+  return { session, found };
+}
+
+async function managedCliSnapshot(identity, body = {}) {
+  const tabId = body.tabId || body.targetId || managedObservedState(identity.profile).currentTabId;
+  if (!tabId) throw Object.assign(new Error('tabId is required for managed CLI snapshot'), { statusCode: 400 });
+  const { session, found } = await managedCliFindTab(identity, tabId);
+  if (!found) throw Object.assign(new Error('Tab not found'), { statusCode: 404 });
+  const { tabState } = found;
+  updateTabRecoveryMeta(tabState, { userId: identity.userId, sessionKey: found.listItemId, tabId, profileDir: session.profileDir, siteKey: identity.siteKey, task_id: body.task_id || body.taskId });
+  const offset = Number.parseInt(String(body.offset || 0), 10) || 0;
+  const currentUrl = tabState.page.url();
+  if (!tabState.lastSnapshot || tabState.lastSnapshotUrl !== currentUrl) {
+    tabState.refs = await refreshTabRefs(tabState, { reason: 'managed_cli_snapshot' });
+    tabState.lastSnapshot = `url: ${currentUrl}\ntitle: ${await tabState.page.title().catch(() => '')}`;
+    tabState.lastSnapshotUrl = currentUrl;
+  }
+  const win = windowSnapshot(tabState.lastSnapshot, offset);
+  return {
+    ok: true,
+    tabId,
+    url: currentUrl,
+    title: await tabState.page.title().catch(() => ''),
+    snapshot: win.text,
+    refsCount: tabState.refs.size,
+    truncated: win.truncated,
+    totalChars: win.totalChars,
+    hasMore: win.hasMore,
+    nextOffset: win.nextOffset,
+  };
+}
+
+async function managedCliAct(identity, body = {}) {
+  const action = body.action || body.kind || body.type;
+  const tabId = body.tabId || body.targetId || managedObservedState(identity.profile).currentTabId;
+  if (!tabId) throw Object.assign(new Error('tabId is required for managed CLI act'), { statusCode: 400 });
+  const payload = managedCliPayload(identity, body);
+  if (action === 'scroll') {
+    const { session, found } = await managedCliFindTab(identity, tabId);
+    if (!found) throw Object.assign(new Error('Tab not found'), { statusCode: 404 });
+    const amount = body.amount || 500;
+    const direction = body.direction || 'down';
+    await humanScroll(found.tabState.page, { direction, amount, profile: payload.humanProfile });
+    return { ok: true, tabId, url: found.tabState.page.url(), title: await found.tabState.page.title().catch(() => ''), action, sessionKey: found.listItemId, userId: session ? identity.userId : identity.userId };
+  }
+  throw Object.assign(new Error('Unsupported managed CLI action'), { statusCode: 400 });
+}
+
+app.post('/managed/cli/open', async (req, res) => managedCliHandle(req, res, 'open', async (identity) => {
+  const payload = managedCliPayload(identity, req.body, { url: req.body?.url || identity.defaultStartUrl });
+  const session = await getSession(identity.userId, { profileDir: identity.profileDir });
+  const { result } = await createServerOwnedTab(session, {
+    ...payload,
+    reqId: req.reqId,
+    eventMetadata: { managedCli: true },
+  });
+  return { ok: true, ...result, userId: identity.userId, sessionKey: identity.sessionKey };
+}));
+
+app.post('/managed/cli/snapshot', async (req, res) => managedCliHandle(req, res, 'snapshot', async (identity) => {
+  return managedCliSnapshot(identity, req.body || {});
+}, { write: false }));
+
+app.post('/managed/cli/act', async (req, res) => managedCliHandle(req, res, 'act', async (identity) => {
+  return managedCliAct(identity, req.body || {});
+}));
+
+app.post('/managed/cli/memory/record', async (req, res) => managedCliHandle(req, res, 'memory.record', async (identity) => {
+  const tabId = req.body?.tabId || req.body?.targetId || managedObservedState(identity.profile).currentTabId;
+  if (!tabId) throw Object.assign(new Error('tabId is required for managed CLI memory.record'), { statusCode: 400 });
+  const { found } = await managedCliFindTab(identity, tabId);
+  if (!found) throw Object.assign(new Error('Tab not found'), { statusCode: 404 });
+  const actionKey = req.body?.actionKey || 'default';
+  const saved = await recordAgentHistoryFlow(found.tabState, req.body?.siteKey || identity.siteKey, actionKey, {
+    aliases: req.body?.aliases || [],
+    labels: req.body?.labels || [],
+  });
+  return { ok: true, tabId, path: saved.path, siteKey: req.body?.siteKey || identity.siteKey, actionKey };
+}));
+
+app.post('/managed/cli/memory/replay', async (req, res) => managedCliHandle(req, res, 'memory.replay', async (identity, context) => {
+  const allowLlmFallback = explicitAllowLlmRepair(req.body || {});
+  const allow_llm_fallback = allowLlmFallback;
+  context.llm_used = false;
+  const siteKey = req.body?.siteKey || identity.siteKey;
+  const actionKey = req.body?.actionKey || 'default';
+  const loaded = await loadAgentHistory(siteKey, actionKey);
+  const steps = loaded.payload?.hermes_meta?.derived_flow?.steps || [];
+  if (!Array.isArray(steps) || steps.length === 0) {
+    throw Object.assign(new Error(`AgentHistory flow has no replayable steps for ${siteKey}/${actionKey}`), { statusCode: 404 });
+  }
+  return { ok: true, mode: 'memory.replay', llm_used: Boolean(allow_llm_fallback && context.llm_used), allow_llm_fallback, siteKey, actionKey, steps: steps.length };
+}));
+
+app.post('/managed/cli/checkpoint', async (req, res) => managedCliHandle(req, res, 'checkpoint', async (identity) => {
+  const key = normalizeUserId(identity.userId);
+  const session = sessions.get(key);
+  if (!session) throw Object.assign(new Error(`No active managed browser session for ${key}`), { statusCode: 404 });
+  const reason = req.body?.reason || 'manual_checkpoint';
+  await pluginEvents.emitAsync('session:storage:checkpoint', { userId: key, profileDir: identity.profileDir, reason });
+  return { ok: true, userId: key, profileDir: identity.profileDir, reason, persisted: true };
+}));
+
+app.post('/managed/cli/release', async (req, res) => managedCliHandle(req, res, 'release', async (identity) => {
+  return managedProfileLeases.release({ profile: identity.profile, lease_id: req.body?.lease_id || req.body?.leaseId });
+}));
+
+function managedApiSuccess(operation, result, extra = {}) {
+  return {
+    success: Boolean(result.ok),
+    status: Boolean(result.ok) ? 'ok' : 'error',
+    operation,
+    result,
+    ...extra,
+  };
+}
+
+async function managedApiHandle(req, res, operation, work, options = {}) {
+  let context = { mode: options.mode || 'local_api', llm_used: false };
+  try {
+    const identity = requireManagedBrowserProfileIdentity(req.body || {}, { operation: `managed.api.${operation}` });
+    context = { ...context, profile: identity.profile };
+    if (options.write === false) {
+      managedReadAllowed({ ...(req.body || {}), profile: identity.profile }, managedProfileLeases, {
+        allowLockedRead: CONFIG.managedProfileAllowLockedReads,
+      });
+    }
+    const result = await work(identity, context);
+    res.json(managedApiSuccess(operation, result, {
+      profile: identity.profile,
+      site: identity.siteKey,
+      llm_used: Boolean(context.llm_used),
+    }));
+  } catch (err) {
+    handleRouteError(err, req, res, { operation, profile: context.profile, llm_used: Boolean(context.llm_used) });
+  }
+}
+
+function explicitManagedNavigateRestore(body = {}) {
+  return body.restoreCurrentTab === true || body.restore_current_tab === true || body.allowCurrentTabNavigate === true || body.allow_current_tab_navigate === true;
+}
+
+function assertManagedNavigateAllowed(identity, body = {}, tabId) {
+  if (!tabId || explicitManagedNavigateRestore(body)) return;
+  if (!identity?.securityPolicy?.requireConfirmationForBindingActions) return;
+  throw Object.assign(new Error('refusing to navigate existing managed tab without explicit restoreCurrentTab'), {
+    statusCode: 409,
+    code: 'current_tab_navigation_blocked',
+    currentTabId: tabId,
+    requires: ['restoreCurrentTab'],
+  });
+}
+
+async function managedApiOpenOrNavigate(identity, body = {}) {
+  const targetUrl = body.url || identity.defaultStartUrl;
+  const urlErr = validateUrl(targetUrl);
+  if (urlErr) throw Object.assign(new Error(urlErr), { statusCode: 400 });
+  const explicitTabId = body.tab_id || body.tabId || body.targetId;
+  const observedTabId = managedObservedState(identity.profile).currentTabId;
+  const tabId = explicitTabId || observedTabId;
+  assertManagedNavigateAllowed(identity, body, explicitTabId ? null : observedTabId);
+  await assertManagedFingerprintCoherent(identity, body);
+  const payload = managedCliPayload(identity, body, { url: targetUrl });
+  if (!tabId) {
+    const session = await getSession(identity.userId, { profileDir: identity.profileDir });
+    const { result } = await createServerOwnedTab(session, {
+      ...payload,
+      reqId: body.reqId,
+      eventMetadata: { managedApi: true },
+    });
+    return { ok: true, ...result, tab_id: result.tabId, userId: identity.userId, sessionKey: identity.sessionKey };
+  }
+  const reqBody = { ...payload, userId: identity.userId };
+  const { session, found } = await managedCliFindTab(identity, tabId);
+  if (!found) throw Object.assign(new Error('Tab not found'), { statusCode: 404 });
+  const { tabState } = found;
+  const result = await withTabLock(tabId, async () => {
+    await withPageLoadDuration('managed_api_navigate', () => tabState.page.goto(targetUrl, { waitUntil: 'domcontentloaded', timeout: 30000 }));
+    tabState.visitedUrls.add(targetUrl);
+    invalidateTabSnapshot(tabState);
+    tabState.refs = isGoogleSerp(tabState.page.url()) ? new Map() : await buildRefs(tabState.page);
+    return { ok: true, tabId, tab_id: tabId, url: tabState.page.url(), title: await tabState.page.title().catch(() => '') };
+  });
+  updateTabRecoveryMeta(tabState, { userId: identity.userId, sessionKey: found.listItemId, tabId, profileDir: session.profileDir, siteKey: identity.siteKey, task_id: body.task_id || body.taskId });
+  recordTabAction(tabState, { kind: 'navigate', url: result.url || reqBody.url, result });
+  return { ...result, userId: identity.userId, sessionKey: found.listItemId };
+}
+
+async function managedApiFingerprintDoctor(identity, body = {}) {
+  const tabId = body.tab_id || body.tabId || body.targetId || managedObservedState(identity.profile).currentTabId;
+  const profileRoot = resolveProfileRoot(identity.profileDir);
+  const launchProfile = await resolveLaunchProfile(identity.userId, { profileDir: profileRoot });
+  const persistedFingerprint = await loadPersistedFingerprint(profileRoot, identity.userId, { warn: (msg, fields) => log('warn', msg, fields) });
+  if (persistedFingerprint?.fingerprint) launchProfile.persistedFingerprint = persistedFingerprint.fingerprint;
+  const expected = expectedFingerprintFromLaunchProfile(launchProfile);
+  if (!tabId) {
+    return { ok: true, status: 'not_running', expected, persistedFingerprint: Boolean(persistedFingerprint?.fingerprint), issues: [] };
+  }
+  const { found } = await managedCliFindTab(identity, tabId);
+  if (!found) throw Object.assign(new Error('Tab not found'), { statusCode: 404 });
+  const observed = await withTabLock(tabId, async () => collectBrowserFingerprintSnapshot(found.tabState.page));
+  const coherence = validateFingerprintCoherence({ expected, observed });
+  const registry = readDisplayRegistry();
+  const registryEntry = registry[identity.userId] || registry[identity.profile] || null;
+  const vnc = validateVncGeometry({
+    expected: {
+      profileWindowSize: launchProfile?.managedDisplayPolicy?.profileWindowSize || expected.screen || expected.viewport,
+      screen: expected.screen,
+      viewport: expected.viewport,
+    },
+    observed: { browser: observed, registry: registryEntry },
+  });
+  const issues = [...coherence.issues, ...vnc.issues];
+  const ok = coherence.ok && vnc.ok;
+  return {
+    ok,
+    status: ok ? 'coherent' : 'incoherent',
+    tabId,
+    tab_id: tabId,
+    expected,
+    observed,
+    vnc: { ok: vnc.ok, registry: registryEntry, issues: vnc.issues },
+    issues,
+    persistedFingerprint: Boolean(persistedFingerprint?.fingerprint),
+  };
+}
+
+async function assertManagedFingerprintCoherent(identity, body = {}) {
+  const tabId = body.tab_id || body.tabId || body.targetId || managedObservedState(identity.profile).currentTabId;
+  if (!tabId) return { checked: false, reason: 'no_tab' };
+  const { found } = await managedCliFindTab(identity, tabId);
+  if (!found) return { checked: false, reason: 'tab_not_found' };
+  const profileRoot = resolveProfileRoot(identity.profileDir);
+  const launchProfile = await resolveLaunchProfile(identity.userId, { profileDir: profileRoot });
+  const persistedFingerprint = await loadPersistedFingerprint(profileRoot, identity.userId, { warn: (msg, fields) => log('warn', msg, fields) });
+  if (persistedFingerprint?.fingerprint) launchProfile.persistedFingerprint = persistedFingerprint.fingerprint;
+  const expected = expectedFingerprintFromLaunchProfile(launchProfile);
+  const observed = await withTabLock(tabId, async () => collectBrowserFingerprintSnapshot(found.tabState.page));
+  const coherence = validateFingerprintCoherence({ expected, observed });
+  const registry = readDisplayRegistry();
+  const registryEntry = registry[identity.userId] || registry[identity.profile] || null;
+  const vnc = validateVncGeometry({
+    expected: { profileWindowSize: launchProfile.persona?.window || launchProfile.persona?.viewport || launchProfile.persona?.screen },
+    observed: { registry: registryEntry, browser: observed },
+  });
+  const combinedIssues = [...coherence.issues, ...vnc.issues];
+  if (combinedIssues.length > 0) {
+    throw Object.assign(new Error(`managed browser fingerprint is incoherent; run fingerprint doctor before write actions: ${combinedIssues.map((item) => item.kind || item.key || item.code || item.type || 'issue').join(', ')}`), {
+      statusCode: 409,
+      code: 'managed_fingerprint_incoherent',
+      issues: combinedIssues,
+    });
+  }
+  return { checked: true };
+}
+
+async function managedApiConsoleEval(identity, body = {}) {
+  const tabId = body.tab_id || body.tabId || body.targetId || managedObservedState(identity.profile).currentTabId;
+  if (!tabId) throw Object.assign(new Error('tab_id is required for console eval'), { statusCode: 400 });
+  const { session, found } = await managedCliFindTab(identity, tabId);
+  if (!found) throw Object.assign(new Error('Tab not found'), { statusCode: 404 });
+  const expression = typeof body.expression === 'string' && body.expression.trim() ? body.expression : 'document.title';
+  const value = await withTabLock(tabId, async () => found.tabState.page.evaluate((source) => {
+    // eslint-disable-next-line no-eval
+    return eval(source);
+  }, expression));
+  return { ok: true, tabId, tab_id: tabId, value, url: found.tabState.page.url(), title: await found.tabState.page.title().catch(() => ''), userId: identity.userId, sessionKey: found.listItemId };
+}
+
+async function readManagedCredential({ profile, site, kind }) {
+  const storePath = credentialPath({ profile, site, kind });
+  const { stdout } = await execFileAsync('pass', ['show', storePath], { maxBuffer: 1024 * 1024 });
+  return stdout.replace(/\n$/, '');
+}
+
+async function waitForPageSettled(page, { timeoutMs = 15000, settleMs = 500 } = {}) {
+  const deadline = Date.now() + timeoutMs;
+  let lastUrl = page.url();
+  let stableSince = Date.now();
+  while (Date.now() < deadline) {
+    await page.waitForTimeout(250);
+    const currentUrl = page.url();
+    if (currentUrl !== lastUrl) {
+      lastUrl = currentUrl;
+      stableSince = Date.now();
+    }
+    const readyState = await page.evaluate(() => document.readyState).catch(() => 'loading');
+    if (readyState !== 'loading' && Date.now() - stableSince >= settleMs) return;
+  }
+}
+
+async function evaluateAuchanSession(page) {
+  return page.evaluate(() => {
+    const body = document.body?.innerText || '';
+    const url = window.location.href;
+    const authenticated = /Bonjour,\s+[^\n]+\s*:\)|Cagnotte\s*:/i.test(body)
+      && !/^https:\/\/compte\.auchan\.fr\/auth\//i.test(url);
+    const loginPage = /^https:\/\/compte\.auchan\.fr\/auth\//i.test(url) || /E-mail\s+Mot de passe\s+Se souvenir de moi/i.test(body);
+    const challenge = /captcha|recaptcha|code\s+(sms|email|e-mail)|vérification|verification|confirmez|confirmer/i.test(body);
+    return {
+      authenticated,
+      loginPage,
+      challenge,
+      url,
+      title: document.title,
+      bodySample: body.slice(0, 500),
+    };
+  });
+}
+
+async function clickAuchanLoginIfNeeded(page) {
+  const state = await evaluateAuchanSession(page);
+  if (state.authenticated || state.loginPage) return state;
+  await page.evaluate(() => {
+    const textOf = (el) => (el.innerText || el.value || el.getAttribute('aria-label') || el.getAttribute('title') || '').trim();
+    const candidate = Array.from(document.querySelectorAll('button,a,[role="button"],[role="link"]'))
+      .find((el) => /me connecter|se connecter|connexion/i.test(textOf(el)));
+    candidate?.click();
+  });
+  await waitForPageSettled(page, { timeoutMs: 10000 });
+  return evaluateAuchanSession(page);
+}
+
+async function submitAuchanLoginForm(page, { username, password }) {
+  await page.waitForSelector('#username, input[name="username"]', { timeout: 10000 });
+  await page.waitForSelector('#password, input[name="password"]', { timeout: 10000 });
+  await page.evaluate(({ username: userValue, password: passwordValue }) => {
+    const setNativeValue = (el, value) => {
+      const proto = el instanceof HTMLTextAreaElement ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
+      const descriptor = Object.getOwnPropertyDescriptor(proto, 'value');
+      descriptor.set.call(el, value);
+      el.dispatchEvent(new Event('input', { bubbles: true }));
+      el.dispatchEvent(new Event('change', { bubbles: true }));
+    };
+    const usernameInput = document.querySelector('#username, input[name="username"]');
+    const passwordInput = document.querySelector('#password, input[name="password"]');
+    setNativeValue(usernameInput, userValue);
+    setNativeValue(passwordInput, passwordValue);
+    const form = passwordInput.form || document.querySelector('form');
+    const submit = document.querySelector('#kc-login, button[name="login"], button[type="submit"], input[type="submit"]');
+    if (form?.requestSubmit) form.requestSubmit(submit || undefined);
+    else if (submit?.click) submit.click();
+    else form?.submit?.();
+  }, { username, password });
+  await waitForPageSettled(page, { timeoutMs: 20000 });
+}
+
+async function ensureAuchanAuthStrategy({ profile, site, identity }) {
+  const session = await getSession(identity.userId, { profileDir: identity.profileDir });
+  let tabId = managedObservedState(identity.profile).currentTabId;
+  let found = tabId ? findTab(session, tabId) : null;
+  if (!found) {
+    const opened = await createServerOwnedTab(session, {
+      ...managedCliPayload(identity, {}, { url: identity.defaultStartUrl || 'https://www.auchan.fr/' }),
+      eventMetadata: { managedAuth: true },
+    });
+    tabId = opened.result.tabId;
+    found = findTab(session, tabId);
+  }
+  if (!found) throw new Error('Auchan auth tab not found after open');
+
+  const { tabState } = found;
+  const result = await withTabLock(tabId, async () => {
+    const page = tabState.page;
+    if (!/^https:\/\/(www\.)?auchan\.fr\//i.test(page.url()) && !/^https:\/\/compte\.auchan\.fr\//i.test(page.url())) {
+      await page.goto(identity.defaultStartUrl || 'https://www.auchan.fr/', { waitUntil: 'domcontentloaded', timeout: 30000 });
+    }
+    await waitForPageSettled(page, { timeoutMs: 10000 });
+
+    let state = await clickAuchanLoginIfNeeded(page);
+    if (state.authenticated) return { ok: true, status: 'authenticated', login_required: false, human_required: false, tabId, checkpoint_saved: false };
+    if (!state.loginPage) {
+      return { ok: false, status: 'login_required', login_required: true, human_required: true, next_action: 'inspect_auchan_login_entrypoint', reason: 'login_entrypoint_not_found', tabId };
+    }
+
+    const username = await readManagedCredential({ profile, site, kind: 'username' });
+    const password = await readManagedCredential({ profile, site, kind: 'password' });
+    await submitAuchanLoginForm(page, { username, password });
+    state = await evaluateAuchanSession(page);
+    if (state.authenticated) {
+      invalidateTabSnapshot(tabState);
+      await pluginEvents.emitAsync('session:storage:checkpoint', { userId: normalizeUserId(identity.userId), profileDir: identity.profileDir, reason: 'auth_ensure_auchan' });
+      return { ok: true, status: 'authenticated', login_required: false, human_required: false, checkpoint_saved: true, tabId, url: state.url, title: state.title };
+    }
+    if (state.challenge) {
+      return { ok: true, status: 'checkpoint_required', login_required: true, human_required: true, next_action: 'resolve_auchan_human_challenge', tabId, url: state.url, title: state.title };
+    }
+    return { ok: false, status: 'login_failed', login_required: true, human_required: false, next_action: 'check_auchan_credentials_or_selectors', tabId, url: state.url, title: state.title, reason: state.loginPage ? 'still_on_login_page' : 'not_authenticated_after_submit' };
+  });
+
+  return { ...result, tab_id: tabId };
+}
+
+
+async function managedApiFileUpload(identity, body = {}) {
+  const tabId = body.tab_id || body.tabId || body.targetId || managedObservedState(identity.profile).currentTabId;
+  if (!tabId) throw Object.assign(new Error('tab_id is required for file upload'), { statusCode: 400 });
+  const selector = typeof body.selector === 'string' && body.selector.trim() ? body.selector : 'input[type="file"]';
+  const paths = Array.isArray(body.paths) ? body.paths : [];
+  if (!paths.length) throw Object.assign(new Error('paths is required for file upload'), { statusCode: 400 });
+  for (const filePath of paths) {
+    if (typeof filePath !== 'string' || !filePath.trim()) throw Object.assign(new Error('invalid file path for upload'), { statusCode: 400 });
+    const stat = await fs.promises.stat(filePath).catch(() => null);
+    if (!stat || !stat.isFile()) throw Object.assign(new Error(`upload file not found: ${filePath}`), { statusCode: 400 });
+  }
+  const { session, found } = await managedCliFindTab(identity, tabId);
+  if (!found) throw Object.assign(new Error('Tab not found'), { statusCode: 404 });
+  const result = await withTabLock(tabId, async () => {
+    const locator = found.tabState.page.locator(selector).first();
+    await locator.setInputFiles(paths, { timeout: 30000 });
+    return found.tabState.page.evaluate((sel) => {
+      const input = document.querySelector(sel);
+      const files = Array.from(input?.files || []).map((file) => ({ name: file.name, size: file.size, type: file.type }));
+      return { files, count: files.length };
+    }, selector);
+  });
+  invalidateTabSnapshot(found.tabState);
+  updateTabRecoveryMeta(found.tabState, { userId: identity.userId, sessionKey: found.listItemId, tabId, profileDir: session.profileDir, siteKey: identity.siteKey, task_id: body.task_id || body.taskId });
+  return { ok: true, tabId, tab_id: tabId, uploaded: paths.length, selector, files: result.files || [], file_count: result.count || 0, url: found.tabState.page.url(), title: await found.tabState.page.title().catch(() => '') };
+}
+
+async function managedApiCheckpointStorage(identity, body = {}) {
+  const key = normalizeUserId(identity.userId);
+  const session = sessions.get(key);
+  if (!session) throw Object.assign(new Error(`No active managed browser session for ${key}`), { statusCode: 404 });
+  const reason = body.reason || 'managed_api_checkpoint';
+  await pluginEvents.emitAsync('session:storage:checkpoint', { userId: key, profileDir: identity.profileDir, reason });
+  return { ok: true, userId: key, profileDir: identity.profileDir, reason, persisted: true };
+}
+
+function clearManagedLifecycleTimer(session) {
+  if (session?._managedLifecycleCloseTimer) {
+    clearTimeout(session._managedLifecycleCloseTimer);
+    session._managedLifecycleCloseTimer = null;
+  }
+}
+
+function applyManagedLifecyclePolicyToSession(session, policy) {
+  if (!session || !policy) return;
+  clearManagedLifecycleTimer(session);
+  session._managedLifecycleClosePolicy = policy;
+  session.keepAlive = policy.mode === 'never';
+  for (const group of session.tabGroups.values()) {
+    for (const tabState of group.values()) tabState.keepAlive = policy.mode === 'never';
+  }
+}
+
+async function closeManagedProfileSession(identity, reason = 'managed_lifecycle_close') {
+  const key = normalizeUserId(identity.userId);
+  const session = sessions.get(key);
+  if (!session) return { ok: true, closed: false, userId: key, reason: 'no_active_session' };
+  clearManagedLifecycleTimer(session);
+  await closeSession(key, session, { reason, clearDownloads: true, clearLocks: true });
+  scheduleBrowserIdleShutdown(key);
+  return { ok: true, closed: true, userId: key, reason };
+}
+
+function scheduleManagedLifecycleClose(identity, policy) {
+  const key = normalizeUserId(identity.userId);
+  const session = sessions.get(key);
+  if (!session) return { ok: true, scheduled: false, reason: 'no_active_session' };
+  applyManagedLifecyclePolicyToSession(session, policy);
+  if (policy.mode === 'now' || policy.mode === 'after_task') {
+    setImmediate(() => closeManagedProfileSession(identity, `managed_lifecycle_${policy.mode}`).catch((err) => log('error', 'managed lifecycle close failed', { profile: identity.profile, error: err.message })));
+    return { ok: true, scheduled: true, mode: policy.mode };
+  }
+  if (policy.mode === 'delay') {
+    session._managedLifecycleCloseTimer = setTimeout(() => {
+      closeManagedProfileSession(identity, 'managed_lifecycle_delay').catch((err) => log('error', 'managed lifecycle delayed close failed', { profile: identity.profile, error: err.message }));
+    }, policy.delaySeconds * 1000);
+    session._managedLifecycleCloseTimer.unref?.();
+    return { ok: true, scheduled: true, mode: policy.mode, delaySeconds: policy.delaySeconds };
+  }
+  return { ok: true, scheduled: false, mode: policy.mode };
+}
+
+async function managedApiLifecycleOpen(identity, body = {}) {
+  const result = await managedApiOpenOrNavigate(identity, { ...body, restoreCurrentTab: true });
+  const close = body.close ? normalizeLifecycleClosePolicy(body.close) : getLifecycleDefault({ profile: identity.profile, site: identity.siteKey });
+  const session = sessions.get(normalizeUserId(identity.userId));
+  if (close && session) applyManagedLifecyclePolicyToSession(session, close);
+  return { ok: true, ...result, lifecycle: { close: close || null } };
+}
+
+async function managedApiLifecycleClose(identity, body = {}) {
+  const close = normalizeLifecycleClosePolicy(body.close || { mode: 'after_task' });
+  const scheduled = scheduleManagedLifecycleClose(identity, close);
+  return { ok: true, close, ...scheduled, external_actions: close.mode === 'never' ? 0 : 1 };
+}
+
+async function managedApiLifecycleDefault(identity, body = {}) {
+  return setLifecycleDefault({ profile: identity.profile, site: identity.siteKey, close: body.close });
+}
+
+async function managedApiRunFlow(identity, body = {}, context = {}) {
+  const allow_llm_repair = body.allow_llm_repair === undefined && body.allowLlmRepair === undefined
+    ? false
+    : Boolean(body.allow_llm_repair || body.allowLlmRepair);
+  await assertManagedFingerprintCoherent(identity, body);
+  const flow = body.flow || body.actionKey || body.action_key || 'default';
+  const siteKey = body.siteKey || body.site || identity.siteKey;
+  await seedSharedManagedFlows({ siteKey });
+  const flow_availability = await sharedManagedFlowAvailability({ siteKey, profile: identity.profile });
+  const loaded = await loadAgentHistory(siteKey, flow, { profile: identity.profile });
+  const steps = loaded.payload?.hermes_meta?.derived_flow?.steps || [];
+  if (!Array.isArray(steps) || steps.length === 0) {
+    throw Object.assign(new Error(`AgentHistory flow has no replayable steps for ${siteKey}/${flow}`), { statusCode: 404 });
+  }
+  const tabId = body.tab_id || body.tabId || body.targetId || managedObservedState(identity.profile).currentTabId || fly.makeTabId();
+  const session = await getSession(identity.userId, { profileDir: identity.profileDir });
+  let found = findTab(session, tabId);
+  if (!found) {
+    const page = await session.context.newPage();
+    const tabState = createTabState(page, { userId: identity.userId, sessionKey: identity.sessionKey || 'default', tabId });
+    attachDownloadListener(tabState, tabId, log, pluginEvents, identity.userId);
+    getTabGroup(session, identity.sessionKey || 'default').set(tabId, tabState);
+    refreshActiveTabsGauge();
+    found = findTab(session, tabId);
+  }
+  if (!found) throw Object.assign(new Error('Tab not found'), { statusCode: 404 });
+  const { tabState } = found;
+  const replayRefreshRefs = async (reason = 'managed_api_flow_replay') => {
+    invalidateTabSnapshot(tabState);
+    tabState.refs = await refreshTabRefs(tabState, { reason });
+    return tabState.refs;
+  };
+  const replayHandlers = createMemoryReplayHandlers({
+    tabState,
+    refreshRefs: replayRefreshRefs,
+    waitForPageReady,
+  });
+  let learned = false;
+  let learnedPath;
+  const learnedPayloads = [];
+  const replay = await replayStepsSelfHealing(steps, {
+    handlers: {
+      ...replayHandlers,
+      navigate: async (step) => {
+        await tabState.page.goto(step.url, { waitUntil: 'domcontentloaded', timeout: 30000 });
+        invalidateTabSnapshot(tabState);
+        tabState.refs = await buildRefs(tabState.page);
+        return { ok: true, url: tabState.page.url(), title: await tabState.page.title().catch(() => '') };
+      },
+      file_upload: async (step) => {
+        const selector = typeof step.selector === 'string' && step.selector.trim() ? step.selector : 'input[type="file"]';
+        const paths = Array.isArray(step.paths) ? step.paths : [];
+        if (!paths.length) return { ok: false, error: 'paths is required for file_upload step' };
+        for (const filePath of paths) {
+          if (typeof filePath !== 'string' || !filePath.trim()) return { ok: false, error: 'invalid file path for upload' };
+          const stat = await fs.promises.stat(filePath).catch(() => null);
+          if (!stat || !stat.isFile()) return { ok: false, error: `upload file not found: ${filePath}` };
+        }
+        const locator = tabState.page.locator(selector).first();
+        await locator.setInputFiles(paths, { timeout: 30000 });
+        const uploadState = await tabState.page.evaluate((sel) => {
+          const input = document.querySelector(sel);
+          const files = Array.from(input?.files || []).map((file) => ({ name: file.name, size: file.size, type: file.type }));
+          return { files, count: files.length };
+        }, selector);
+        await tabState.page.waitForTimeout(500).catch(() => {});
+        invalidateTabSnapshot(tabState);
+        tabState.refs = await buildRefs(tabState.page);
+        return { ok: true, uploaded: paths.length, file_count: uploadState.count || 0, files: uploadState.files || [], url: tabState.page.url() };
+      },
+      click: async (step) => {
+        const locator = step.ref ? refToLocator(tabState.page, step.ref, tabState.refs) : tabState.page.locator(step.selector);
+        if (!locator) return { ok: false, error: `Ref not found: ${step.ref}` };
+        await humanPrepareTarget(tabState.page, locator, {
+          behaviorPersona: tabState.humanSession?.behaviorPersona,
+          viewport: tabState.humanSession?.viewport,
+        });
+        const clickResult = await humanClick(tabState.page, locator, {
+          profile: body.humanProfile || 'fast',
+          from: getHumanCursor(tabState.humanSession),
+          viewport: tabState.humanSession?.viewport,
+        });
+        updateHumanCursor(tabState.humanSession, clickResult.position);
+        await tabState.page.waitForTimeout(500);
+        invalidateTabSnapshot(tabState);
+        tabState.refs = await buildRefs(tabState.page);
+        return { ok: true, url: tabState.page.url() };
+      },
+      type: async (step) => {
+        const locator = step.ref ? refToLocator(tabState.page, step.ref, tabState.refs) : tabState.page.locator(step.selector).first();
+        if (!locator) return { ok: false, error: `Ref not found: ${step.ref}` };
+        await humanPrepareTarget(tabState.page, locator, { behaviorPersona: tabState.humanSession?.behaviorPersona });
+        await humanType(tabState.page, locator, step.text, {
+          profile: body.humanProfile || 'fast',
+          clearFirst: true,
+          mistakesRate: 0,
+        });
+        invalidateTabSnapshot(tabState);
+        return { ok: true, url: tabState.page.url() };
+      },
+      press: async (step) => {
+        await humanPress(tabState.page, step.key, { profile: body.humanProfile || 'fast' });
+        invalidateTabSnapshot(tabState);
+        return { ok: true, url: tabState.page.url() };
+      },
+      scroll: async (step) => {
+        await humanScroll(tabState.page, {
+          direction: step.direction || 'down',
+          amount: step.amount || 500,
+          profile: body.humanProfile || 'fast',
+        });
+        invalidateTabSnapshot(tabState);
+        return { ok: true, url: tabState.page.url() };
+      },
+      back: async () => {
+        await tabState.page.goBack({ timeout: 10000 }).catch(() => {});
+        tabState.refs = await buildRefs(tabState.page);
+        return { ok: true, url: tabState.page.url() };
+      },
+    },
+    refreshRefs: async () => {
+      await replayRefreshRefs('managed_api_flow_repair');
+    },
+    getCandidates: async () => candidatesFromRefs(tabState.refs),
+    detectInterrupt: async () => detectInterrupt({
+      url: tabState.page.url(),
+      title: await tabState.page.title().catch(() => ''),
+      text: await tabState.page.evaluate(() => document.body?.innerText?.slice(0, 1500) || '').catch(() => ''),
+    }),
+    adaptivePacing: (interrupt) => adaptivePacingForInterrupt(interrupt, {
+      profile: body.humanProfile || 'medium',
+      consecutiveInterrupts: tabState.consecutiveTimeouts,
+    }),
+    waitForPacing: async (delayMs) => {
+      await tabState.page.waitForTimeout(Math.min(delayMs, 3000));
+    },
+    resolveInterrupt: async (interrupt) => {
+      if (interrupt?.type !== 'cookie_banner') return { ok: true, skipped: true };
+      tabState.refs = await refreshTabRefs(tabState, { reason: 'managed_api_flow_interrupt' });
+      const candidate = chooseCookieConsentCandidate(candidatesFromRefs(tabState.refs));
+      if (!candidate?.ref) return { ok: false, error: 'No cookie consent candidate found' };
+      const locator = refToLocator(tabState.page, candidate.ref, tabState.refs);
+      if (!locator) return { ok: false, error: `Ref not found: ${candidate.ref}` };
+      await humanPrepareTarget(tabState.page, locator, { behaviorPersona: tabState.humanSession?.behaviorPersona });
+      const clickResult = await humanClick(tabState.page, locator, {
+        profile: body.humanProfile || 'fast',
+        from: getHumanCursor(tabState.humanSession),
+      });
+      updateHumanCursor(tabState.humanSession, clickResult.position);
+      await tabState.page.waitForTimeout(500);
+      tabState.refs = await refreshTabRefs(tabState, { reason: 'managed_api_flow_interrupt_resolved' });
+      return { ok: true, ref: candidate.ref, type: interrupt.type };
+    },
+    validate: async (expected) => validateOutcome(expected, {
+      getUrl: async () => tabState.page.url(),
+      getTitle: async () => tabState.page.title(),
+      hasText: async (text) => tabState.page.getByText(text).first().isVisible({ timeout: 1000 }).catch(() => false),
+      hasSelector: async (selector) => tabState.page.locator(selector).first().isVisible({ timeout: 1000 }).catch(() => false),
+    }),
+    parameters: body.params || body.parameters || {},
+    max_side_effect_level: body.max_side_effect_level || body.maxSideEffectLevel || 'publish',
+    learnRepairs: body.learnRepairs === true || body.learn_repairs === true,
+    learnRepair: async (payload) => {
+      const saved = await applyLearnedDomRepair({
+        siteKey,
+        actionKey: flow,
+        sourcePath: loaded.path,
+        payload,
+      });
+      learned = true;
+      learnedPath = saved.path;
+      learnedPayloads.push(payload);
+    },
+    ...(allow_llm_repair ? {
+      allowLlmFallback: true,
+      plannerFallback: createManagedPlannerFallback({ tabState, candidatesFromRefs }),
+    } : {}),
+  });
+  context.llm_used = Boolean(replay.llm_used);
+  return {
+    ok: replay.ok !== false,
+    ...replay,
+    mode: replay.mode || 'memory.replay',
+    allow_llm_repair,
+    siteKey,
+    actionKey: flow,
+    flow,
+    params: body.params || {},
+    steps: steps.length,
+    flow_availability,
+    tabId,
+    tab_id: tabId,
+    url: tabState.page.url(),
+    title: await tabState.page.title().catch(() => ''),
+    ...(learned ? { learned, learnedPath, learnedRepairs: learnedPayloads.length } : {}),
+  };
+}
+
+async function managedApiListFlows(identity, body = {}) {
+  const siteKey = body.siteKey || body.site || identity.siteKey;
+  await seedSharedManagedFlows({ siteKey });
+  const flows = await searchFlows({ siteKey, profile: identity.profile, query: body.query || '' });
+  return { ok: true, mode: 'memory.catalog', llm_used: false, siteKey, profile: identity.profile, flows, count: flows.length };
+}
+
+async function managedApiInspectFlow(identity, body = {}) {
+  const flow = body.flow || body.actionKey || body.action_key || 'default';
+  const siteKey = body.siteKey || body.site || identity.siteKey;
+  await seedSharedManagedFlows({ siteKey });
+  const loaded = await loadAgentHistory(siteKey, flow, { profile: identity.profile });
+  const meta = loaded.payload?.hermes_meta || {};
+  const steps = Array.isArray(meta.derived_flow?.steps) ? meta.derived_flow.steps : [];
+  return {
+    ok: true,
+    mode: 'memory.inspect',
+    llm_used: false,
+    siteKey: meta.site_key || siteKey,
+    actionKey: meta.action_key || flow,
+    flow,
+    profile: identity.profile,
+    aliases: Array.isArray(meta.aliases) ? meta.aliases : [],
+    labels: Array.isArray(meta.labels) ? meta.labels : [],
+    parameters: Array.isArray(meta.parameters) ? meta.parameters : [],
+    side_effect_level: meta.side_effect_level,
+    safe_to_share: meta.safe_to_share,
+    steps,
+    steps_count: steps.length,
+    path: loaded.path,
+  };
+}
+
+function notificationCaptureKey(identity, origin) {
+  return `${identity.profile}:${origin}`;
+}
+
+function validateNotificationOrigin(identity, body = {}) {
+  const origin = body.origin || identity.defaultStartUrl;
+  if (!origin) throw Object.assign(new Error('origin is required'), { statusCode: 400 });
+  const parsed = new URL(origin);
+  if (!['http:', 'https:'].includes(parsed.protocol)) {
+    throw Object.assign(new Error(`Blocked notification origin scheme: ${parsed.protocol}`), { statusCode: 400 });
+  }
+  const site = body.site || body.siteKey || identity.siteKey;
+  if (site !== identity.siteKey) {
+    throw Object.assign(new Error(`site must match managed profile site ${identity.siteKey}`), { statusCode: 400 });
+  }
+  return parsed.origin;
+}
+
+async function managedNotificationsHandle(req, res, operation, work, options = {}) {
+  let context = { llm_used: false };
+  try {
+    const identity = requireManagedBrowserProfileIdentity(req.body || {}, { operation: `notifications.${operation}` });
+    const origin = validateNotificationOrigin(identity, req.body || {});
+    context = { profile: identity.profile, site: identity.siteKey, origin, llm_used: false };
+    if (options.write === false) {
+      managedReadAllowed({ ...(req.body || {}), profile: identity.profile }, managedProfileLeases, {
+        allowLockedRead: CONFIG.managedProfileAllowLockedReads,
+      });
+    }
+    const result = await work(identity, origin, context);
+    res.json(normalizeManagedNotificationResponse(result, context));
+  } catch (err) {
+    handleRouteError(err, req, res, normalizeManagedNotificationResponse({ success: false, error: err.code || 'failed' }, context));
+  }
+}
+
+function recordManagedNotificationForIdentity(identity, origin) {
+  return (notification) => {
+    try {
+      recordNotification({
+        storagePath: notificationStorePath(identity),
+        recorded_at: new Date().toISOString(),
+        site: identity.siteKey,
+        origin,
+        ...notification,
+      });
+    } catch (err) {
+      log('warn', 'notification capture record failed', { profile: identity.profile, error: err.message });
+    }
+  };
+}
+
+async function ensureManagedNotificationPageCapture(identity, origin, page) {
+  return ensureNotificationCaptureOnPage(page, {
+    profile: identity.profile,
+    site: identity.siteKey,
+    origin,
+    onNotification: recordManagedNotificationForIdentity(identity, origin),
+  });
+}
+
+async function readNotificationPermission(identity, origin) {
+  const session = await getSession(identity.userId, { profileDir: identity.profileDir });
+  const page = session.context.pages().find((candidate) => !candidate.isClosed?.()) || await session.context.newPage();
+  if (page.url() === 'about:blank') await page.goto(origin, { waitUntil: 'domcontentloaded', timeout: 30000 }).catch(() => {});
+  const capture = await ensureManagedNotificationPageCapture(identity, origin, page);
+  const permission = await page.evaluate(() => (typeof Notification === 'function' ? Notification.permission : 'unsupported')).catch(() => 'unsupported');
+  return { session, page, permission, capture };
+}
+
+async function emitManagedNotificationSelfTest(identity, origin) {
+  const { page, permission, capture } = await readNotificationPermission(identity, origin);
+  const diagnostics = await page.evaluate(() => {
+    const title = `ManagedBrowser notification self-test ${Date.now()}`;
+    const captureBindingAvailable = Boolean(window.__managedBrowserNotificationCaptureBindingAvailable?.());
+    let notification_created = false;
+    let notification_error = null;
+    try {
+      if (typeof Notification !== 'function') throw new Error('Notification unsupported');
+      new Notification(title, {
+        body: 'Managed Browser capture self-test',
+        tag: 'managed-browser-self-test',
+        data: { url: window.location.href },
+      });
+      notification_created = true;
+    } catch (err) {
+      notification_error = String(err && err.message ? err.message : err);
+    }
+    return {
+      title,
+      notification_created,
+      notification_error,
+      capture_binding_available: captureBindingAvailable,
+      capture_last_attempt: window.__managedBrowserNotificationCaptureLastAttempt || null,
+      capture_last_error: window.__managedBrowserNotificationCaptureLastError || null,
+    };
+  });
+  return { success: diagnostics.notification_created, permission, capture, ...diagnostics, external_actions: 0 };
+}
+
+async function checkpointManagedNotificationStorage(identity, reason = 'notifications_permission_change') {
+  await pluginEvents.emitAsync('session:storage:checkpoint', { userId: identity.userId, profileDir: identity.profileDir, reason });
+  return { persisted: true, reason };
+}
+
+function disableNotificationCaptureForOrigin(identity, origin) {
+  disabledNotificationCaptureOrigins.add(notificationCaptureKey(identity, origin));
+  return { disabled: true };
+}
+
+function notificationStorePath(identity) {
+  return path.join(identity.profileDir, 'notifications.jsonl');
+}
+
+function parseNotificationLimit(value, fallback = 50) {
+  const limit = Number.parseInt(String(value ?? fallback), 10);
+  if (!Number.isFinite(limit) || limit <= 0) return fallback;
+  return Math.min(limit, 500);
+}
+
+async function readNotificationCursorState(statePath) {
+  if (!statePath) return {};
+  try {
+    const text = await fs.promises.readFile(statePath, 'utf8');
+    return text.trim() ? JSON.parse(text) : {};
+  } catch (err) {
+    if (err?.code === 'ENOENT') return {};
+    throw err;
+  }
+}
+
+async function writeNotificationCursorState(statePath, state) {
+  if (!statePath) return { persisted: false };
+  await fs.promises.mkdir(path.dirname(statePath), { recursive: true });
+  await fs.promises.writeFile(statePath, `${JSON.stringify(state, null, 2)}\n`, 'utf8');
+  return { persisted: true, state };
+}
+
+app.post('/notifications/status', async (req, res) => managedNotificationsHandle(req, res, 'status', async (identity, origin) => {
+  const { permission } = await readNotificationPermission(identity, origin);
+  return { success: true, permission, capture_disabled: disabledNotificationCaptureOrigins.has(notificationCaptureKey(identity, origin)), external_actions: 0 };
+}, { write: false }));
+
+app.post('/notifications/enable', async (req, res) => managedNotificationsHandle(req, res, 'enable', async (identity, origin) => {
+  const confirm = req.body?.confirm;
+  if (confirm === true) {
+    const session = await getSession(identity.userId, { profileDir: identity.profileDir });
+    await session.context.grantPermissions(['notifications'], { origin });
+    disabledNotificationCaptureOrigins.delete(notificationCaptureKey(identity, origin));
+    const { permission } = await readNotificationPermission(identity, origin);
+    const checkpoint = await checkpointManagedNotificationStorage(identity, 'notifications_enable');
+    return { success: true, permission, ...checkpoint, external_actions: 1 };
+  }
+  const { permission } = await readNotificationPermission(identity, origin);
+  return { success: false, status: 'requires_confirm', error: 'requires_confirm', requires_confirm: true, permission, external_actions: 0 };
+}));
+
+app.post('/notifications/disable', async (req, res) => managedNotificationsHandle(req, res, 'disable', async (identity, origin) => {
+  const disabled = disableNotificationCaptureForOrigin(identity, origin);
+  const { permission } = await readNotificationPermission(identity, origin);
+  return { success: true, permission, ...disabled, external_actions: 0 };
+}));
+
+app.post('/notifications/list', async (req, res) => managedNotificationsHandle(req, res, 'list', async (identity, origin) => {
+  const limit = parseNotificationLimit(req.body?.limit, 50);
+  const notifications = listNotifications({ storagePath: notificationStorePath(identity), profile: identity.profile, site: identity.siteKey, origin, limit });
+  return { success: true, notifications, count: notifications.length, limit, external_actions: 0 };
+}, { write: false }));
+
+app.post('/notifications/poll', async (req, res) => managedNotificationsHandle(req, res, 'poll', async (identity, origin) => {
+  const { permission } = await readNotificationPermission(identity, origin);
+  if (permission === 'default' || permission === 'denied') {
+    return { success: false, status: 'requires_enable', permission, notifications: [], count: 0, external_actions: 0 };
+  }
+  const limit = parseNotificationLimit(req.body?.limit, 50);
+  const cursorState = await readNotificationCursorState(req.body?.state);
+  const cursor = req.body?.cursor || cursorState.cursor || null;
+  const all = listNotifications({ storagePath: notificationStorePath(identity), profile: identity.profile, site: identity.siteKey, origin });
+  const startIndex = cursor ? all.findIndex((notification) => notification.id === cursor) + 1 : 0;
+  const notifications = all.slice(Math.max(0, startIndex)).slice(0, limit);
+  const nextCursor = notifications.length ? notifications[notifications.length - 1].id : cursor;
+  const persisted = await writeNotificationCursorState(req.body?.state, { cursor: nextCursor, updated_at: new Date().toISOString() });
+  return { success: true, permission, notifications, count: notifications.length, cursor: nextCursor, state_persisted: persisted.persisted, external_actions: 0 };
+}, { write: false }));
+
+app.post('/notifications/self-test', async (req, res) => managedNotificationsHandle(req, res, 'self-test', async (identity, origin) => {
+  return emitManagedNotificationSelfTest(identity, origin);
+}, { write: false }));
+
+app.post('/notifications/mark-read', async (req, res) => managedNotificationsHandle(req, res, 'mark-read', async (identity) => {
+  const ids = Array.isArray(req.body?.ids) ? req.body.ids : (req.body?.id ? [req.body.id] : []);
+  const result = markNotificationsRead({ storagePath: notificationStorePath(identity), ids });
+  return { success: true, ...result, external_actions: 0 };
+}));
+
+app.post('/profile/status', async (req, res) => managedApiHandle(req, res, 'profile.status', async (identity) => {
+  return managedBrowserProfileStatus({ profile: identity.profile, site: identity.siteKey }, { observed: managedObservedState(identity.profile) });
+}, { write: false }));
+
+app.post('/fingerprint/doctor', async (req, res) => managedApiHandle(req, res, 'fingerprint.doctor', async (identity) => {
+  return managedApiFingerprintDoctor(identity, req.body || {});
+}, { write: false }));
+
+app.post('/auth/status', async (req, res) => managedApiHandle(req, res, 'auth.status', async (identity) => {
+  return managedAuthStatus({ profile: identity.profile, site: identity.siteKey });
+}, { write: false }));
+
+app.post('/auth/ensure', async (req, res) => managedApiHandle(req, res, 'auth.ensure', async (identity) => {
+  const strategy = identity.siteKey === 'auchan'
+    ? ({ profile, site }) => ensureAuchanAuthStrategy({ profile, site, identity })
+    : undefined;
+  return managedAuthEnsure({ profile: identity.profile, site: identity.siteKey }, { strategy });
+}));
+
+app.post('/navigate', async (req, res, next) => {
+  if (!req.body?.profile) return next();
+  return managedApiHandle(req, res, 'navigate', async (identity) => managedApiOpenOrNavigate(identity, req.body || {}));
+});
+
+app.post('/console/eval', async (req, res) => managedApiHandle(req, res, 'console.eval', async (identity) => managedApiConsoleEval(identity, req.body || {}), { write: false }));
+
+app.post('/file-upload', async (req, res) => managedApiHandle(req, res, 'file-upload', async (identity) => managedApiFileUpload(identity, req.body || {})));
+
+app.post('/storage/checkpoint', async (req, res) => managedApiHandle(req, res, 'storage.checkpoint', async (identity) => managedApiCheckpointStorage(identity, req.body || {})));
+
+app.post('/flow/run', async (req, res) => managedApiHandle(req, res, 'flow.run', async (identity, context) => managedApiRunFlow(identity, req.body || {}, context)));
+
+app.post('/flow/list', async (req, res) => managedApiHandle(req, res, 'flow.list', async (identity) => managedApiListFlows(identity, req.body || {}), { write: false }));
+
+app.post('/flow/inspect', async (req, res) => managedApiHandle(req, res, 'flow.inspect', async (identity) => managedApiInspectFlow(identity, req.body || {}), { write: false }));
+
+app.post('/lifecycle/open', async (req, res) => managedApiHandle(req, res, 'lifecycle.open', async (identity) => managedApiLifecycleOpen(identity, req.body || {})));
+
+app.post('/lifecycle/close', async (req, res) => managedApiHandle(req, res, 'lifecycle.close', async (identity) => managedApiLifecycleClose(identity, req.body || {})));
+
+app.post('/lifecycle/default', async (req, res) => managedApiHandle(req, res, 'lifecycle.default', async (identity) => managedApiLifecycleDefault(identity, req.body || {})));
+
+const LEGACY_VISIBLE_TAB_USER_ID_PROFILES = new Set(['leboncoin-cim', 'leboncoin-ge', 'emploi', 'example-demo']);
+
+function visibleTabIdentityInput(body = {}) {
+  if ((!body.profile || !String(body.profile).trim()) && LEGACY_VISIBLE_TAB_USER_ID_PROFILES.has(String(body.userId || ''))) {
+    return { ...body, profile: String(body.userId) };
+  }
+  return body;
+}
+
 // Create new tab
 app.post('/managed/visible-tab', async (req, res) => {
   try {
-    const { userId, sessionKey, url, profileDir, display, browserPersonaKey, humanPersonaKey, humanProfile, siteKey, task_id, taskId } = req.body;
-    if (!userId || !sessionKey) {
-      return res.status(400).json({ error: 'userId and sessionKey required' });
-    }
+    const identity = requireManagedBrowserProfileIdentity(visibleTabIdentityInput(req.body || {}), { operation: 'managed.visible-tab' });
+    const payload = managedCliPayload(identity, req.body, { url: req.body?.url || identity.defaultStartUrl });
+    const lease = ensureManagedLease({ ...payload, owner: payload.owner || payload.owner_cli || payload.ownerCli || 'managed.visible-tab' }, managedProfileLeases);
+    const { userId, sessionKey, url, profileDir, display } = payload;
     if (!url) {
       return res.status(400).json({ error: 'url required' });
     }
@@ -2197,20 +3647,11 @@ app.post('/managed/visible-tab', async (req, res) => {
       }
 
       const { result: tabResult } = await createServerOwnedTab(session, {
-        userId,
-        sessionKey,
-        url,
-        browserPersonaKey,
-        humanPersonaKey,
-        humanProfile,
-        profileDir,
-        siteKey,
-        task_id,
-        taskId,
+        ...payload,
         reqId: req.reqId,
         eventMetadata: { visible: true, display: display || null },
       });
-      return { ok: true, ...tabResult, userId, sessionKey, visible: true, display: display || null };
+      return { ok: true, ...tabResult, userId, sessionKey, visible: true, display: display || null, lease_id: lease.lease_id };
     })(), requestTimeoutMs(), 'managed visible tab create');
 
     res.json(result);
@@ -2222,6 +3663,8 @@ app.post('/managed/visible-tab', async (req, res) => {
 
 app.post('/managed/recover-tab', async (req, res) => {
   try {
+    const identity = requireManagedBrowserProfileIdentity(req.body, { operation: 'managed.recover-tab' });
+    enforceManagedLease({ ...req.body, profile: identity.profile }, managedProfileLeases);
     const { userId, sessionKey, profileDir, siteKey, tabId, fallbackUrl, browserPersonaKey, humanPersonaKey, humanProfile, task_id, taskId } = req.body;
     if (!userId) return res.status(400).json({ error: 'userId required' });
     const resolvedSessionKey = sessionKey || 'default';
@@ -2279,6 +3722,8 @@ app.post('/managed/recover-tab', async (req, res) => {
 
 app.post('/managed/storage-checkpoint', async (req, res) => {
   try {
+    const identity = requireManagedBrowserProfileIdentity(req.body, { operation: 'managed.storage-checkpoint' });
+    enforceManagedLease({ ...req.body, profile: identity.profile }, managedProfileLeases);
     const { userId, profileDir, reason } = req.body;
     if (!userId) return res.status(400).json({ error: 'userId required' });
     const key = normalizeUserId(userId);
@@ -2957,6 +4402,8 @@ app.post('/tabs/:tabId/type', async (req, res) => {
         }
       }
       if (shouldSubmit) await humanPress(tabState.page, 'Enter', { profile: humanProfile });
+      invalidateTabSnapshot(tabState);
+      await tabState.page.waitForTimeout(50).catch(() => undefined);
     });
     
     const result = { ok: true, url: tabState.page.url(), title: await tabState.page.title().catch(() => '') };
@@ -3120,7 +4567,11 @@ app.post('/tabs/:tabId/refresh', async (req, res) => {
     tabState.toolCalls++; tabState.consecutiveTimeouts = 0;
 
     const result = await withTabLock(tabId, async () => {
-      await tabState.page.reload({ timeout: 30000 });
+      await Promise.all([
+        tabState.page.waitForLoadState('load', { timeout: 30000 }).catch(() => undefined),
+        tabState.page.reload({ timeout: 30000 }),
+      ]);
+      invalidateTabSnapshot(tabState);
       tabState.refs = await buildRefs(tabState.page);
       return { ok: true, url: tabState.page.url() };
     });
@@ -3568,6 +5019,9 @@ app.post('/memory/replay', async (req, res) => {
       refreshRefs: replayRefreshRefs,
       waitForPageReady,
     });
+    let learned = false;
+    let learnedPath;
+    const learnedPayloads = [];
     const replay = await replayStepsSelfHealing(steps, {
       handlers: {
         ...replayHandlers,
@@ -3667,30 +5121,29 @@ app.post('/memory/replay', async (req, res) => {
         hasSelector: async (selector) => tabState.page.locator(selector).first().isVisible({ timeout: 1000 }).catch(() => false),
       }),
       parameters,
+      learnRepairs,
+      learnRepair: async (payload) => {
+        const saved = await applyLearnedDomRepair({
+          siteKey,
+          actionKey,
+          sourcePath: loaded.path,
+          payload,
+        });
+        learned = true;
+        learnedPath = saved.path;
+        learnedPayloads.push(payload);
+      },
       ...(allowLlmFallback ? {
         allowLlmFallback: true,
         plannerFallback: createManagedPlannerFallback({ tabState, candidatesFromRefs }),
       } : {}),
     });
-    let learned = false;
-    let learnedPath;
-    if (learnRepairs === true && replay.ok && replay.results?.some((result) => result.repaired_step)) {
-      const updatedSteps = steps.map((step, index) => replay.results[index]?.repaired_step || step);
-      const saved = await persistAgentHistorySteps({
-        siteKey,
-        actionKey,
-        steps: updatedSteps,
-        learnedFrom: loaded.path,
-      });
-      learned = true;
-      learnedPath = saved.path;
-    }
     res.json({
       ...replay,
       targetId: resolvedTabId,
       tabId: resolvedTabId,
       url: tabState.page.url(),
-      ...(learned ? { learned, learnedPath } : {}),
+      ...(learned ? { learned, learnedPath, learnedRepairs: learnedPayloads.length } : {}),
     });
   } catch (err) {
     log('error', 'agent history replay endpoint failed', { reqId: req.reqId, error: err.message });

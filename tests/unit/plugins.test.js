@@ -2,11 +2,31 @@
  * Tests for lib/plugins.js — createPluginEvents, loadPlugins, and config reading.
  */
 import { describe, test, expect, jest } from '@jest/globals';
+import { loadConfig } from '../../lib/config.js';
 import { createPluginEvents, loadPlugins } from '../../lib/plugins.js';
 import fs from 'fs';
 import path from 'path';
 import os from 'os';
 import { fileURLToPath } from 'url';
+
+describe('server config', () => {
+  test('forwards shared display settings to plugin-launched server subprocesses', () => {
+    const previousDisplay = process.env.CAMOFOX_SHARED_DISPLAY;
+    const previousUserIds = process.env.CAMOFOX_SHARED_DISPLAY_USER_IDS;
+    process.env.CAMOFOX_SHARED_DISPLAY = ':99';
+    process.env.CAMOFOX_SHARED_DISPLAY_USER_IDS = 'leboncoin-cim,leboncoin-ge';
+    try {
+      const cfg = loadConfig();
+      expect(cfg.serverEnv.CAMOFOX_SHARED_DISPLAY).toBe(':99');
+      expect(cfg.serverEnv.CAMOFOX_SHARED_DISPLAY_USER_IDS).toBe('leboncoin-cim,leboncoin-ge');
+    } finally {
+      if (previousDisplay === undefined) delete process.env.CAMOFOX_SHARED_DISPLAY;
+      else process.env.CAMOFOX_SHARED_DISPLAY = previousDisplay;
+      if (previousUserIds === undefined) delete process.env.CAMOFOX_SHARED_DISPLAY_USER_IDS;
+      else process.env.CAMOFOX_SHARED_DISPLAY_USER_IDS = previousUserIds;
+    }
+  });
+});
 
 describe('lib/plugins', () => {
   describe('createPluginEvents', () => {
@@ -97,15 +117,20 @@ describe('lib/plugins', () => {
       };
     }
 
-    test('returns empty array when plugins directory does not exist', async () => {
-      // loadPlugins checks the hardcoded PLUGINS_DIR, not tmpDir.
-      // We test by providing a mock ctx — if no plugins/ dir exists
-      // relative to lib/, it would still load the real plugins.
-      // Instead, test via the actual project's plugin loader.
+    test('returns empty array when plugins are disabled in runtime config', async () => {
+      const ctx = { ...makeMockCtx(), config: { disablePlugins: true } };
+      const app = {};
+
+      const loaded = await loadPlugins(app, ctx);
+
+      expect(loaded).toEqual([]);
+      expect(ctx.log).toHaveBeenCalledWith('info', 'plugins disabled by runtime config');
+    });
+
+    test('returns an array when plugins directory exists', async () => {
       const ctx = makeMockCtx();
       const app = {};
 
-      // This tests the real plugin loading — should return the project's actual plugins
       const loaded = await loadPlugins(app, ctx);
       expect(Array.isArray(loaded)).toBe(true);
       // Each loaded plugin should be a string

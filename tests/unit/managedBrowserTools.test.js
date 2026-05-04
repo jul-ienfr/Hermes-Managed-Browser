@@ -42,15 +42,12 @@ describe('managed browser tool compatibility', () => {
     }
   });
 
-  test('managed policy includes a clean JU v2 profile with isolated storage and persona keys', () => {
-    expect(managedPolicySource).toContain("'leboncoin-ju-v2'");
-    expect(managedPolicySource).toContain("profile: 'leboncoin-ju-v2'");
-    expect(managedPolicySource).toContain("userId: 'leboncoin-ju-v2'");
-    expect(managedPolicySource).toContain("sessionKey: 'managed:leboncoin-ju-v2'");
-    expect(managedPolicySource).toContain("profileDir: '/home/jul/.vnc-browser-profiles/leboncoin-ju-v2'");
-    expect(managedPolicySource).toContain("browserPersonaKey: 'managed:leboncoin-ju-v2:browser'");
-    expect(managedPolicySource).toContain("humanPersonaKey: 'managed:leboncoin-ju-v2:human'");
-    expect(managedPolicySource).toContain("['ju-v2', { profile: 'leboncoin-ju-v2', siteKey: 'leboncoin' }]");
+  test('managed policy exposes only the active CIM profile', () => {
+    expect(managedPolicySource).toContain("'leboncoin-cim'");
+    expect(managedPolicySource).toContain("profile: 'leboncoin-cim'");
+    expect(managedPolicySource).toContain("userId: 'leboncoin-cim'");
+    expect(managedPolicySource).toContain("sessionKey: 'managed:leboncoin-cim'");
+    expect(managedPolicySource).toContain("profileDir: '/home/jul/.vnc-browser-profiles/leboncoin-cim'");
   });
 
   test('managed tools require explicit profile and resolve managed policy', () => {

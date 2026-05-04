@@ -7,7 +7,7 @@ describe('Form Submission', () => {
   let testSiteUrl;
   
   beforeAll(async () => {
-    const port = await startServer();
+    const port = await startServer(0, { DEBUG_SERVER: process.env.DEBUG_SERVER || '' });
     serverUrl = getServerUrl();
     
     const testPort = await startTestSite();

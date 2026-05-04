@@ -547,7 +547,7 @@ export default function register(api: PluginApi) {
   };
 
   const managedProfileProperties = {
-    profile: { type: "string", description: "Managed browser profile, e.g. leboncoin-ju or leboncoin-ge" },
+    profile: { type: "string", description: "Managed browser profile, e.g. leboncoin-cim or leboncoin-ge" },
     site: { type: "string", description: "Optional managed site key, e.g. leboncoin" },
   };
 

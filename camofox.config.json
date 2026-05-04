@@ -10,7 +10,10 @@
       "resolution": "1920x1080",
       "vncPort": 5901,
       "novncPort": 6081,
-      "viewOnly": false
+      "viewOnly": false,
+      "bind": "0.0.0.0",
+      "humanOnly": true,
+      "managedRegistryOnly": true
     }
   }
 }

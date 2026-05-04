@@ -38,7 +38,12 @@ class MockVirtualDisplay {
   }
 }
 
+const { readFileSync } = await import('node:fs');
+const { fileURLToPath } = await import('node:url');
+const { dirname, join } = await import('node:path');
+
 const { register } = await import('./index.js');
+const __dirname = dirname(fileURLToPath(import.meta.url));
 
 describe('vnc plugin', () => {
   let events, ctx, mockApp, routes;
@@ -49,6 +54,7 @@ describe('vnc plugin', () => {
     routes = {};
     mockApp = {
       get: jest.fn((path, ...handlers) => { routes[`GET ${path}`] = handlers; }),
+      post: jest.fn((path, ...handlers) => { routes[`POST ${path}`] = handlers; }),
     };
     ctx = {
       events,
@@ -71,6 +77,9 @@ describe('vnc plugin', () => {
       viewOnly: pluginConfig.viewOnly || false,
       vncPort: pluginConfig.vncPort || '5900',
       novncPort: pluginConfig.novncPort || '6080',
+      bind: pluginConfig.bind || '127.0.0.1',
+      humanOnly: pluginConfig.humanOnly !== false,
+      managedRegistryOnly: pluginConfig.managedRegistryOnly !== false,
     }));
   });
 
@@ -91,11 +100,14 @@ describe('vnc plugin', () => {
   });
 
   test('passes resolved config to startWatcher', async () => {
-    await register(mockApp, ctx, { enabled: true, password: 'secret', vncPort: 5901 });
+    await register(mockApp, ctx, { enabled: true, password: 'secret', vncPort: 5901, bind: '0.0.0.0' });
     expect(mockStartWatcher).toHaveBeenCalledWith(
       expect.objectContaining({
         vncPassword: 'secret',
         vncPort: 5901,
+        bind: '0.0.0.0',
+        humanOnly: true,
+        managedRegistryOnly: true,
         log: ctx.log,
         events,
       }),
@@ -109,6 +121,15 @@ describe('vnc plugin', () => {
     const args = vd.xvfb_args;
     const screenIdx = args.indexOf('0');
     expect(args[screenIdx + 1]).toBe('1280x720x24');
+  });
+
+  test('allows profile-specific Xvfb resolution so noVNC is filled by that profile window', async () => {
+    await register(mockApp, ctx, { enabled: true, resolution: '1920x1080' });
+
+    const vd = ctx.createVirtualDisplay({ resolution: '1680x945x24' });
+    const args = vd.xvfb_args;
+    const screenIdx = args.indexOf('0');
+    expect(args[screenIdx + 1]).toBe('1680x945x24');
   });
 
   test('appends x24 depth to WxH resolution', async () => {
@@ -200,5 +221,29 @@ describe('vnc plugin', () => {
     const proc = mockStartWatcher.mock.results[0].value;
     events.emit('server:shutdown');
     expect(proc.kill).toHaveBeenCalledWith('SIGTERM');
+  });
+
+  test('human VNC LAN auth exception is limited to VNC routes', () => {
+    const source = readFileSync(join(__dirname, 'index.js'), 'utf8');
+
+    expect(source).toContain('function isPrivateLanAddress');
+    expect(source).toContain('authMiddleware: humanVncAuthMiddleware');
+    expect(source).toContain("app.get('/sessions/:userId/storage_state', authMiddleware");
+  });
+
+  test('noVNC URL opens with automatic websocket connection parameters', () => {
+    const source = readFileSync(join(__dirname, 'index.js'), 'utf8');
+
+    expect(source).toContain('autoconnect=true');
+    expect(source).toContain('resize=scale');
+    expect(source).toContain('path=websockify');
+  });
+
+  test('noVNC patch provides crypto.randomUUID fallback before UI handlers', () => {
+    const patch = readFileSync(join(__dirname, 'novnc-error-handler.patch.js'), 'utf8');
+
+    expect(patch).toContain("typeof window.crypto.randomUUID !== 'function'");
+    expect(patch).toContain("Object.defineProperty(window.crypto, 'randomUUID'");
+    expect(patch.indexOf('Object.defineProperty(window.crypto')).toBeLessThan(patch.indexOf("window.addEventListener('error'"));
   });
 });

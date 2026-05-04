@@ -44,10 +44,9 @@ describe('Navigate abort on tab deletion', () => {
   test('DELETE /tabs/:tabId aborts navigateAbort before page close', () => {
     // The delete handler should call .abort() on navigateAbort
     // Find the DELETE handler section
-    const deleteSection = serverSource.slice(
-      serverSource.indexOf("app.delete('/tabs/:tabId'"),
-      serverSource.indexOf("app.delete('/tabs/:tabId'") + 800,
-    );
+    const deleteStart = serverSource.indexOf("app.delete('/tabs/:tabId'");
+    const deleteEnd = serverSource.indexOf("app.delete('/tabs/group/:listItemId'", deleteStart);
+    const deleteSection = serverSource.slice(deleteStart, deleteEnd);
     expect(deleteSection).toContain('navigateAbort');
     expect(deleteSection).toContain('.abort()');
     // abort() must come BEFORE safePageClose

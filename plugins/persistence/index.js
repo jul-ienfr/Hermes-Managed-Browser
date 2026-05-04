@@ -49,14 +49,14 @@ export async function register(app, ctx, pluginConfig = {}) {
   log('info', 'persistence plugin enabled', { profileDir });
 
   // Track active sessions for checkpoint on close
-  const activeSessions = new Map(); // userId -> context
+  const activeSessions = new Map(); // userId -> { context, profileDir }
 
   /**
    * Checkpoint storage state to disk for a userId.
    */
-  async function checkpoint(userId, context, reason) {
+  async function checkpoint(userId, context, reason, sessionProfileDir = profileDir) {
     if (!context) return;
-    const result = await persistStorageState({ profileDir, userId, context, logger });
+    const result = await persistStorageState({ profileDir: sessionProfileDir || profileDir, userId, context, logger });
     if (result.persisted) {
       log('info', 'storage state persisted', { userId, reason, path: result.storageStatePath });
     }
@@ -66,8 +66,9 @@ export async function register(app, ctx, pluginConfig = {}) {
   // --- Lifecycle hooks ---
 
   // Before session context is created: inject storageState if we have one saved
-  events.on('session:creating', async ({ userId, contextOptions }) => {
-    const storageStatePath = await loadPersistedStorageState(profileDir, userId, logger);
+  events.on('session:creating', async ({ userId, contextOptions, profileDir: sessionProfileDir }) => {
+    const effectiveProfileDir = sessionProfileDir || profileDir;
+    const storageStatePath = await loadPersistedStorageState(effectiveProfileDir, userId, logger);
     if (storageStatePath) {
       contextOptions.storageState = storageStatePath;
       log('info', 'restoring persisted storage state', { userId, storageStatePath });
@@ -76,11 +77,12 @@ export async function register(app, ctx, pluginConfig = {}) {
 
   // After session is created: import bootstrap cookies if no persisted state,
   // and track the context for later checkpointing
-  events.on('session:created', async ({ userId, context }) => {
-    activeSessions.set(userId, context);
+  events.on('session:created', async ({ userId, context, profileDir: sessionProfileDir }) => {
+    const effectiveProfileDir = sessionProfileDir || profileDir;
+    activeSessions.set(userId, { context, profileDir: effectiveProfileDir });
 
     // If no persisted state was restored, try bootstrap cookies
-    const existingState = await loadPersistedStorageState(profileDir, userId, logger);
+    const existingState = await loadPersistedStorageState(effectiveProfileDir, userId, logger);
     if (!existingState) {
       const result = await importBootstrapCookies({
         cookiesDir: config.cookiesDir,
@@ -89,25 +91,42 @@ export async function register(app, ctx, pluginConfig = {}) {
       });
       if (result.imported > 0) {
         log('info', 'bootstrap cookies imported', { userId, count: result.imported, source: result.source });
-        await checkpoint(userId, context, 'bootstrap_cookies');
+        await checkpoint(userId, context, 'bootstrap_cookies', effectiveProfileDir);
       }
     }
   });
 
   // On cookie import: checkpoint
   events.on('session:cookies:import', async ({ userId }) => {
-    const context = activeSessions.get(userId);
-    if (context) {
-      await checkpoint(userId, context, 'cookie_import');
+    const active = activeSessions.get(userId);
+    if (active?.context) {
+      await checkpoint(userId, active.context, 'cookie_import', active.profileDir);
+    }
+  });
+
+  events.on('session:storage:checkpoint', async ({ userId, reason, profileDir: sessionProfileDir }) => {
+    const active = activeSessions.get(userId);
+    if (!active?.context) {
+      throw new Error(`No active session to checkpoint for ${userId}`);
+    }
+    return checkpoint(userId, active.context, reason || 'storage_checkpoint', sessionProfileDir || active.profileDir);
+  });
+
+  events.on('session:storage:export', async ({ userId, profileDir: sessionProfileDir }) => {
+    const active = activeSessions.get(userId);
+    if (active?.context) {
+      await checkpoint(userId, active.context, 'storage_export', sessionProfileDir || active.profileDir);
     }
   });
 
   // Before session destroy: checkpoint while the context is still alive,
   // then remove it from tracking so post-close hooks do not retry.
-  events.on('session:destroying', async ({ userId, reason, context }) => {
-    const trackedContext = activeSessions.get(userId) || context;
+  events.on('session:destroying', async ({ userId, reason, context, profileDir: sessionProfileDir }) => {
+    const active = activeSessions.get(userId);
+    const trackedContext = active?.context || context;
+    const effectiveProfileDir = sessionProfileDir || active?.profileDir || profileDir;
     if (trackedContext) {
-      await checkpoint(userId, trackedContext, reason).catch(() => {});
+      await checkpoint(userId, trackedContext, reason, effectiveProfileDir).catch(() => {});
     }
     activeSessions.delete(userId);
   });
@@ -120,8 +139,8 @@ export async function register(app, ctx, pluginConfig = {}) {
 
   // On shutdown: checkpoint all remaining sessions
   events.on('server:shutdown', async () => {
-    for (const [userId, context] of activeSessions) {
-      await checkpoint(userId, context, 'shutdown').catch(() => {});
+    for (const [userId, active] of activeSessions) {
+      await checkpoint(userId, active.context, 'shutdown', active.profileDir).catch(() => {});
     }
     activeSessions.clear();
   });

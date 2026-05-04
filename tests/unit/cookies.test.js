@@ -18,7 +18,16 @@ async function startServerWithApiKey(apiKey) {
   serverProcess = launchServer({
     pluginDir,
     port,
-    env: { ...cfg.serverEnv, CAMOFOX_API_KEY: apiKey, DEBUG_RESPONSES: 'false' },
+    env: {
+      ...cfg.serverEnv,
+      CAMOFOX_API_KEY: apiKey,
+      DEBUG_RESPONSES: 'false',
+      CAMOFOX_PROFILE_DIR: path.join(__dirname, '..', 'tmp', `cookies-profiles-${process.pid}-${port}`),
+      // Keep this endpoint-focused test isolated from globally enabled plugins.
+      // The VNC plugin starts long-lived child processes on fixed ports, which can
+      // race across repeated subprocess launches and close the test server socket.
+      CAMOFOX_TEST_DISABLE_PLUGINS: '1',
+    },
     log: { info: () => {}, error: (msg) => console.error(msg) },
   });
 
@@ -40,7 +49,14 @@ async function startServerWithoutApiKey() {
   const cfg = loadConfig();
   const pluginDir = path.join(__dirname, '../..');
 
-  const env = { ...cfg.serverEnv, DEBUG_RESPONSES: 'false' };
+  const env = {
+    ...cfg.serverEnv,
+    DEBUG_RESPONSES: 'false',
+    // Keep this endpoint-focused test isolated from globally enabled plugins.
+    // The VNC plugin starts long-lived child processes on fixed ports, which can
+    // race across repeated subprocess launches and close the test server socket.
+    CAMOFOX_TEST_DISABLE_PLUGINS: '1',
+  };
   delete env.CAMOFOX_API_KEY;
 
   serverProcess = launchServer({

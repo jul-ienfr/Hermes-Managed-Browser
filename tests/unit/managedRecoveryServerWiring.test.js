@@ -42,4 +42,13 @@ describe('managed recovery server wiring', () => {
     expect(recoverBlock).toMatch(/tabState\.lastSnapshot = annotatedYaml/);
     expect(recoverBlock).toMatch(/res\.json\(\{[\s\S]*snapshot: annotatedYaml/);
   });
+
+  test('memory replay route persists learned DOM repairs through callback payloads only', () => {
+    const replayBlock = routeBlock(serverSource, 'post', '/memory/replay', '// GET /tabs');
+
+    expect(replayBlock).toContain('learnRepairs');
+    expect(replayBlock).toMatch(/learnRepair: async \(payload\) =>/);
+    expect(replayBlock).toMatch(/applyLearnedDomRepair\(\{[\s\S]*siteKey,[\s\S]*actionKey,[\s\S]*sourcePath: loaded\.path,[\s\S]*payload/);
+    expect(replayBlock).not.toMatch(/replay\.ok && replay\.results\?\.some\(\(result\) => result\.repaired_step\)/);
+  });
 });

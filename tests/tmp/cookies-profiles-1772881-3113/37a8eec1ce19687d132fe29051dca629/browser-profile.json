@@ -1,0 +1,68 @@
+{
+  "version": 1,
+  "persona": {
+    "version": 2,
+    "os": "linux",
+    "locale": "en-US",
+    "languages": [
+      "en-US",
+      "en"
+    ],
+    "timezoneId": "America/New_York",
+    "geolocation": {
+      "latitude": 40.7128,
+      "longitude": -74.006
+    },
+    "screen": {
+      "width": 1536,
+      "height": 864
+    },
+    "window": {
+      "outerWidth": 1536,
+      "outerHeight": 864
+    },
+    "viewport": {
+      "width": 1536,
+      "height": 864
+    },
+    "deviceScaleFactor": 1,
+    "hardwareConcurrency": 8,
+    "deviceMemory": 12,
+    "firefoxUserPrefs": {
+      "browser.startup.page": 0,
+      "browser.sessionstore.resume_from_crash": true,
+      "privacy.resistFingerprinting": false
+    },
+    "launchScreenConstraints": {
+      "minWidth": 1536,
+      "maxWidth": 1536,
+      "minHeight": 864,
+      "maxHeight": 864
+    }
+  },
+  "launchConstraints": {
+    "os": "linux",
+    "locale": "en-US",
+    "screen": null,
+    "window": null,
+    "webglConfig": null
+  },
+  "contextDefaults": {
+    "locale": "en-US",
+    "timezoneId": "America/New_York",
+    "geolocation": {
+      "latitude": 40.7128,
+      "longitude": -74.006
+    },
+    "viewport": {
+      "width": 1536,
+      "height": 864
+    },
+    "deviceScaleFactor": 1
+  },
+  "firefoxUserPrefs": {
+    "browser.startup.page": 0,
+    "browser.sessionstore.resume_from_crash": true,
+    "privacy.resistFingerprinting": false
+  }
+}
