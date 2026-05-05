@@ -1,14 +1,14 @@
-# Camofox Browser — Architecture Python
+# Managed Browser — Architecture Python
 
 ## Vue d'ensemble
 
 Migration complète du serveur Node.js `camofox-browser` (5864 lignes, 55 libs, Express + camoufox-js)
-vers Python FastAPI + camoufox Python 0.4.11 + BrowserForge.
+vers Python FastAPI + Camoufox Python/CloakBrowser + BrowserForge.
 
 ## Dépendances clés
 
-- **camoufox** 0.4.11 — anti-détection Firefox (AsyncCamoufox, launch_options, virtdisplay)
-- **BrowserForge** (via camoufox) — génération de fingerprints: `generate_fingerprint()`
+- **camoufox** >=0.4.11 — anti-détection Firefox (AsyncCamoufox, launch options, binaire Camoufox)
+- **BrowserForge** — génération/cohérence de fingerprints
 - **FastAPI** — serveur REST
 - **Pydantic** — validation des modèles
 - **Prometheus client** — métriques
@@ -17,30 +17,14 @@ vers Python FastAPI + camoufox Python 0.4.11 + BrowserForge.
 ## Structure
 
 ```
-camofox-browser-python/
+managed-browser/server/
 ├── server.py                  # Entrypoint: uvicorn.run()
 ├── camofox/
 │   ├── __init__.py
-│   ├── app.py                 # FastAPI app factory
-│   ├── config.py              # Pydantic config model + loading
-│   └── modules/
-│       ├── auth.py            # Auth middleware + API key check
-│       ├── browser.py         # Browser lifecycle (launch, idle, health)
-│       ├── session.py         # Sessions (maps userId→context+tabs)
-│       ├── proxy.py           # Proxy pool (round_robin, backconnect)
-│       ├── persona.py         # Deterministic persona generation
-│       ├── fingerprint.py     # Fingerprint generation + coherence
-│       ├── profile.py         # Profile persistence on disk
-│       ├── snapshot.py        # Accessibility tree snapshot
-│       ├── actions.py         # Actions navigate/click/type/scroll/press
-│       ├── managed.py         # Managed browser system (lifecycle, leases, CLI)
-│       ├── notifications.py   # Notification capture + polling
-│       ├── memory.py          # Agent history + self-healing replay
-│       ├── interrupts.py      # Interrupt detection + handling
-│       ├── plugins.py         # Plugin event bus
-│       ├── vnc.py             # VNC display management + Xvfb
-│       ├── metrics.py         # Prometheus metrics
-│       └── utils.py           # Helpers (safePageClose, timeouts)
+│   ├── api/                   # FastAPI routers: admin, sessions, tabs, managed, legacy, vnc
+│   ├── core/                  # config, auth, app factory, browser/session lifecycle, plugins, metrics
+│   ├── domain/                # actions, fingerprint/persona/profile/proxy/snapshot, replay, memory, VNC
+│   └── managed/               # managed profiles and leases
 ```
 
 ## Flux de bootstrap
@@ -172,7 +156,7 @@ POST /stop                        — Stopper navigateur
 
 ### Tabs (opérations)
 ```
-GET    /tabs/{tabId}/snapshot     — Snapshot arbre accessibilité
+GET    /tabs/{tabId}/snapshot     — Snapshot DOM compact + refs
 GET    /tabs/{tabId}/screenshot   — Capture d'écran
 GET    /tabs/{tabId}/images       — URLs des images sur la page
 GET    /tabs/{tabId}/links        — Liens de la page

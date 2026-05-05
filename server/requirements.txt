@@ -1,21 +1,14 @@
-#
-# Managed Browser — Python backend
-#
-# Dependencies
-# ------------
-# Install with: pip install -r requirements.txt
-#
-camoufox>=0.5.0
+# Managed Browser Python backend runtime dependencies
+# Prefer editable development installs with: python3 -m pip install -e ".[dev]"
+
+camoufox>=0.4.11
 browserforge>=0.13.10
+fastapi>=0.115.0
+uvicorn[standard]>=0.34.0
+pydantic>=2.0
+pydantic-settings>=2.0
 playwright>=1.49.0
-
-# Web server
-fastapi>=0.110.0
-uvicorn[standard]>=0.29.0
-pydantic>=2.0.0
-
-# Metrics (optional, for /metrics endpoint)
-prometheus-client>=0.19.0
-
-# Development
-pytest>=8.0.0
+cloakbrowser>=0.3.26
+prometheus-client>=0.21.0
+httptools>=0.6.0
+pyyaml>=6.0

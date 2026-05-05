@@ -16,6 +16,8 @@ npm-debug.log*
 # Coverage
 coverage/
 .nyc_output/
+.coverage
+htmlcov/
 
 # Build
 dist/
@@ -43,6 +45,8 @@ railway.toml
 __pycache__/
 *.py[cod]
 .pytest_cache/
+.ruff_cache/
+.mypy_cache/
 *.egg-info/
 .venv/
 venv/
