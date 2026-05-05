@@ -1,0 +1,24 @@
+name: managed-browser
+version: "0.1.0"
+description: Hermes-native Managed Browser tools for persistent multi-engine site profiles
+provides_tools:
+  - managed_browser_launch_visible_window
+  - managed_browser_profile_status
+  - managed_browser_checkpoint_storage
+  - managed_browser_human_view_url
+  - managed_browser_navigate
+  - managed_browser_snapshot
+  - managed_browser_click
+  - managed_browser_type
+  - managed_browser_press
+  - managed_browser_scroll
+  - managed_browser_back
+  - managed_browser_console
+  - managed_browser_get_images
+  - managed_browser_vision
+  - managed_browser_run_memory
+  - managed_browser_run_flow
+  - managed_browser_record_flow
+  - managed_browser_list_memory
+  - managed_browser_inspect_memory
+  - managed_browser_delete_memory

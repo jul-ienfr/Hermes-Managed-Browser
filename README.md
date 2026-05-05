@@ -1,21 +1,50 @@
-<div align="center">
-  <img src="fox.png" alt="camofox-browser" width="200" />
-  <h1>camofox-browser</h1>
-  <p><strong>Anti-detection browser server for AI agents, powered by Camoufox</strong></p>
-  <p>
-    <a href="https://github.com/jo-inc/camofox-browser/actions"><img src="https://img.shields.io/badge/build-passing-brightgreen" alt="Build" /></a>
-    <a href="https://opensource.org/licenses/MIT"><img src="https://img.shields.io/badge/license-MIT-blue" alt="License" /></a>
-    <a href="https://camoufox.com"><img src="https://img.shields.io/badge/engine-Camoufox-red" alt="Camoufox" /></a>
-    <a href="https://hub.docker.com"><img src="https://img.shields.io/badge/docker-ready-blue" alt="Docker" /></a>
-  </p>
-  <p>
-    Standing on the mighty shoulders of <a href="https://camoufox.com">Camoufox</a> - a Firefox fork with fingerprint spoofing at the C++ level.
-    <br/><br/>
-    The same engine behind <a href="https://askjo.ai?ref=camofox">Jo</a> — an AI assistant that doesn't need you to babysit it. Runs half on your Mac, half on a dedicated cloud machine that only you use. Available on macOS, Telegram, and WhatsApp. <a href="https://askjo.ai?ref=camofox">Try the beta free →</a>
-  </p>
-</div>
+# Managed Browser
 
-<br/>
+Managed Browser is a multi-engine browser automation server for AI agents. The current backend lives in `server/` and can route requests explicitly to Camoufox Python, CloakBrowser, and later a legacy Camofox Node bridge.
+
+## Layout
+
+```text
+server/                         Python Managed Browser backend
+  camofox/core/engines.py       engine aliases and engine:userId keys
+  camofox/core/browser.py       Camoufox + CloakBrowser launch lifecycle
+  camofox/core/session.py       engine-aware sessions and tabs
+plugins/hermes/managed-browser/
+                                Hermes managed_browser_* tools and profiles
+```
+
+Supported engine names in the Python backend:
+
+- `camoufox-python` / `camoufox` / `camoufox-146`
+- `cloakbrowser` / `cloak`
+- `camofox-node` is reserved for a later bridge to the legacy Node server
+
+CloakBrowser is Chromium-family and must use its own executable/profile root:
+
+```bash
+CLOAK_BROWSER_ENABLED=1 \
+CLOAK_BROWSER_EXECUTABLE_PATH=/home/jul/.cloakbrowser/chromium-145.0.7632.159.7/chrome \
+MANAGED_BROWSER_DEFAULT_ENGINE=camoufox-python \
+python3 server/server.py
+```
+
+Example API calls:
+
+```bash
+curl -X POST http://127.0.0.1:9377/start \
+  -H 'content-type: application/json' \
+  -d '{"userId":"cloak-smoke","engine":"cloakbrowser"}'
+
+curl -X POST http://127.0.0.1:9377/tabs \
+  -H 'content-type: application/json' \
+  -d '{"userId":"cloak-smoke","engine":"cloakbrowser","url":"https://example.com/"}'
+```
+
+## Legacy Camofox Node documentation
+
+The sections below come from the original Node Camofox project and are kept as legacy reference while the Python Managed Browser backend becomes the main project.
+
+---
 
 ```bash
 git clone https://github.com/jo-inc/camofox-browser && cd camofox-browser

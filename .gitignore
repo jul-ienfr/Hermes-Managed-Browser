@@ -39,6 +39,15 @@ railway.toml
 # Camoufox cache
 .camoufox/
 
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+*.egg-info/
+.venv/
+venv/
+
 # Test artifacts
 test-results/
 playwright-report/
+tests/tmp/cookies-profiles-*/
