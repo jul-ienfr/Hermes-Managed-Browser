@@ -26,6 +26,7 @@ from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 
 from camofox.core.browser import ensure_browser
+from camofox.core.config import config
 from camofox.core.engines import normalize_engine, make_browser_key
 from camofox.core.session import (
     get_session,
@@ -34,6 +35,16 @@ from camofox.core.session import (
     sessions as all_sessions,
 )
 from camofox.core.utils import normalize_user_id
+from camofox.domain.memory_store import list_flows, load_flow
+from camofox.domain.notifications_store import (
+    add_notification,
+    list_notifications,
+    mark_notifications_read,
+    set_notifications_enabled,
+    status_notifications,
+)
+from camofox.domain.profile import persist_storage_state
+from camofox.domain.replay import ReplayError, replay_flow_steps
 from camofox.domain.snapshot import build_snapshot, window_snapshot
 
 log = logging.getLogger("camofox.api.legacy")
@@ -61,6 +72,7 @@ class ConsoleEvalRequest(ProfileSiteRequest):
 
 
 class SnapshotRequest(ProfileSiteRequest):
+    site: str | None = None
     tab_id: str | None = None
 
 
@@ -75,9 +87,11 @@ class StorageCheckpointRequest(ProfileSiteRequest):
 
 
 class FlowRunRequest(ProfileSiteRequest):
-    flow: str
+    flow: str = "browser-actions"
     params: dict[str, Any] = {}
     allow_llm_repair: bool = False
+    tab_id: str | None = None
+    execute: bool = True
 
 
 class FlowInspectRequest(ProfileSiteRequest):
@@ -396,10 +410,17 @@ async def post_file_upload(body: FileUploadRequest):
 
 @router.post("/storage/checkpoint")
 async def post_storage_checkpoint(body: StorageCheckpointRequest):
-    """Save storage state (cookies, localStorage) for a profile. (stub)"""
+    """Save storage state (cookies, localStorage) for a profile."""
+    uid = _to_user_id(body.profile)
+    session = all_sessions.get(_session_key(uid, body.engine))
+    if session is None:
+        raise HTTPException(404, {"error": f"No session for profile '{body.profile}'"})
+    result = await persist_storage_state(session.profile_dir or config.profile_dir, uid, session.context)
+    if result.get("error"):
+        raise HTTPException(500, {"error": result["error"]})
     return {
         "success": True,
-        "result": {"ok": True, "checkpointed": True, "checkpoint": "stub_python_port"},
+        "result": {"ok": True, "checkpointed": True, "reason": body.reason, **result},
     }
 
 
@@ -410,26 +431,65 @@ async def post_storage_checkpoint(body: StorageCheckpointRequest):
 
 @router.post("/flow/run")
 async def post_flow_run(body: FlowRunRequest):
-    return {
-        "success": True,
-        "result": {"ok": True, "note": "not yet implemented (Python port)", "flow": body.flow},
-    }
+    uid = _to_user_id(body.profile)
+    try:
+        flow = load_flow(uid, body.flow, profile_dir=config.profile_dir)
+    except ValueError as err:
+        raise HTTPException(400, {"error": str(err)})
+    if flow is None:
+        raise HTTPException(404, {"error": f"Flow '{body.flow}' not found"})
+    steps = flow.get("flow", [])
+    if not isinstance(steps, list):
+        raise HTTPException(400, {"error": "Persisted flow is not a list"})
+    if not body.execute:
+        result = {
+            "ok": True,
+            "executed": False,
+            "flow": body.flow,
+            "flow_id": body.flow,
+            "flowId": body.flow,
+            "steps": steps,
+            "step_count": flow.get("step_count", len(steps)),
+            "metadata": flow.get("metadata", {}),
+        }
+        return {"success": True, "result": result, "raw": result}
+    session = all_sessions.get(_session_key(uid, body.engine))
+    if session is None:
+        session = await get_session(uid, engine=normalize_engine(body.engine))
+    try:
+        result = await replay_flow_steps(
+            session,
+            user_id=uid,
+            flow=steps,
+            tab_id=body.tab_id,
+            params=body.params,
+            session_key=body.site or "default",
+        )
+    except ReplayError as err:
+        raise HTTPException(422, {"error": str(err), "flow": body.flow})
+    result.update({"flow": body.flow, "flow_id": body.flow, "flowId": body.flow})
+    return {"success": True, "result": result, "raw": result}
 
 
 @router.post("/flow/list")
 async def post_flow_list(body: ProfileSiteRequest):
-    return {
-        "success": True,
-        "result": {"flows": [], "count": 0},
-    }
+    uid = _to_user_id(body.profile)
+    flows = list_flows(uid, profile_dir=config.profile_dir)
+    result = {"flows": flows, "count": len(flows), "profile": body.profile, "site": body.site}
+    return {"success": True, "result": result, "raw": result}
 
 
 @router.post("/flow/inspect")
 async def post_flow_inspect(body: FlowInspectRequest):
-    return {
-        "success": True,
-        "result": {"note": "not yet implemented (Python port)", "flow": body.flow},
-    }
+    uid = _to_user_id(body.profile)
+    try:
+        flow = load_flow(uid, body.flow, profile_dir=config.profile_dir)
+    except ValueError as err:
+        raise HTTPException(400, {"error": str(err)})
+    if flow is None:
+        raise HTTPException(404, {"error": f"Flow '{body.flow}' not found"})
+    result = {"ok": True, "flow": body.flow, "flow_id": body.flow, "flowId": body.flow, **flow}
+    return {"success": True, "result": result, "raw": result}
 
 
 # ---------------------------------------------------------------------------
@@ -439,52 +499,53 @@ async def post_flow_inspect(body: FlowInspectRequest):
 
 @router.post("/notifications/status")
 async def post_notifications_status(body: NotificationsRequest):
-    return {
-        "success": True,
-        "result": {"status": "stub", "note": "not yet implemented (Python port)"},
-        "raw": {"status": "stub", "note": "not yet implemented (Python port)"},
-    }
+    uid = _to_user_id(body.profile)
+    result = {"ok": True, "profile": body.profile, "site": body.site, **status_notifications(uid, config.profile_dir)}
+    return {"success": True, "result": result, "raw": result}
 
 
 @router.post("/notifications/enable")
 async def post_notifications_enable(body: NotificationsEnableRequest):
-    return {
-        "success": True,
-        "result": {
-            "status": "stub",
-            "note": "not yet implemented (Python port)",
-            "confirm": body.confirm,
-        },
-        "raw": {
-            "status": "stub",
-            "note": "not yet implemented (Python port)",
-            "confirm": body.confirm,
-        },
-    }
+    uid = _to_user_id(body.profile)
+    status = set_notifications_enabled(uid, True, config.profile_dir)
+    result = {"ok": True, "profile": body.profile, "site": body.site, "confirm": body.confirm, **status}
+    return {"success": True, "result": result, "raw": result}
 
 
 @router.post("/notifications/list")
 async def post_notifications_list(body: NotificationsListRequest):
-    return {
-        "success": True,
-        "result": {"notifications": [], "count": 0},
-        "raw": {"notifications": [], "count": 0},
-    }
+    uid = _to_user_id(body.profile)
+    notifications = list_notifications(uid, config.profile_dir, limit=body.limit)
+    result = {"ok": True, "notifications": notifications, "count": len(notifications), "profile": body.profile, "site": body.site}
+    return {"success": True, "result": result, "raw": result}
 
 
 @router.post("/notifications/watch")
 async def post_notifications_watch(body: NotificationsWatchRequest):
-    return {
-        "success": True,
-        "result": {"events": [], "count": 0},
-        "raw": {"events": [], "count": 0},
-    }
+    uid = _to_user_id(body.profile)
+    notifications = list_notifications(uid, config.profile_dir, limit=body.limit, unread_only=True)
+    result = {"ok": True, "events": notifications, "count": len(notifications), "profile": body.profile, "site": body.site}
+    return {"success": True, "result": result, "raw": result}
 
 
 @router.post("/notifications/self-test")
 async def post_notifications_self_test(body: NotificationsRequest):
-    return {
-        "success": True,
-        "result": {"status": "stub", "note": "not yet implemented (Python port)"},
-        "raw": {"status": "stub", "note": "not yet implemented (Python port)"},
-    }
+    uid = _to_user_id(body.profile)
+    item = add_notification(
+        uid,
+        {
+            "origin": body.origin,
+            "title": "Camofox self-test",
+            "body": f"Notification capture works for {body.profile}",
+        },
+        config.profile_dir,
+    )
+    result = {"ok": True, "notification": item, "profile": body.profile, "site": body.site}
+    return {"success": True, "result": result, "raw": result}
+
+
+@router.post("/notifications/mark-read")
+async def post_notifications_mark_read(body: NotificationsListRequest):
+    uid = _to_user_id(body.profile)
+    result = {"ok": True, **mark_notifications_read(uid, profile_dir=config.profile_dir)}
+    return {"success": True, "result": result, "raw": result}

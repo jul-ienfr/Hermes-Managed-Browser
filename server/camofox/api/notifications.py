@@ -8,7 +8,14 @@ from typing import Any
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 
+from camofox.core.config import config
 from camofox.core.utils import normalize_user_id
+from camofox.domain.notifications_store import (
+    list_notifications,
+    mark_notifications_read,
+    set_notifications_enabled,
+    status_notifications,
+)
 
 log = logging.getLogger("camofox.api.notifications")
 router = APIRouter()
@@ -55,39 +62,33 @@ class MarkReadRequest(BaseModel):
 async def notification_status(body: UserIdRequest):
     """Return the current notification state for a user."""
     uid = normalize_user_id(body.userId)
-    enabled = _is_enabled(uid)
-    notifications = _get_notifications(uid)
-    return {
-        "ok": True,
-        "enabled": enabled,
-        "count": len(notifications),
-        "userId": uid,
-    }
+    status = status_notifications(uid, config.profile_dir)
+    return {"ok": True, "userId": uid, **status}
 
 
 @router.post("/enable")
 async def notification_enable(body: UserIdRequest):
     """Enable notification capture for a user."""
     uid = normalize_user_id(body.userId)
-    _notification_enabled[uid] = True
+    status = set_notifications_enabled(uid, True, config.profile_dir)
     log.info("Notification capture enabled for user %s", uid)
-    return {"ok": True, "enabled": True, "userId": uid}
+    return {"ok": True, "userId": uid, **status}
 
 
 @router.post("/disable")
 async def notification_disable(body: UserIdRequest):
     """Disable notification capture for a user."""
     uid = normalize_user_id(body.userId)
-    _notification_enabled[uid] = False
+    status = set_notifications_enabled(uid, False, config.profile_dir)
     log.info("Notification capture disabled for user %s", uid)
-    return {"ok": True, "enabled": False, "userId": uid}
+    return {"ok": True, "userId": uid, **status}
 
 
 @router.post("/list")
 async def notification_list(body: UserIdRequest):
     """List buffered notifications for a user."""
     uid = normalize_user_id(body.userId)
-    notifications = _get_notifications(uid)
+    notifications = list_notifications(uid, config.profile_dir)
     return {
         "ok": True,
         "notifications": notifications,
@@ -98,29 +99,22 @@ async def notification_list(body: UserIdRequest):
 
 @router.post("/poll")
 async def notification_poll(body: UserIdRequest):
-    """Poll for new notifications.
-
-    Simplified implementation — returns immediately with any stored
-    notifications rather than blocking.
-    """
+    """Poll for unread notifications without losing durable history."""
     uid = normalize_user_id(body.userId)
-    notifications = _get_notifications(uid)
-    result = {
+    notifications = list_notifications(uid, config.profile_dir, unread_only=True)
+    mark_notifications_read(uid, [str(item.get("id")) for item in notifications], profile_dir=config.profile_dir)
+    return {
         "ok": True,
         "notifications": notifications,
         "count": len(notifications),
         "userId": uid,
     }
-    # Clear after poll (matching the "buffered" semantics)
-    _notification_store[uid] = []
-    return result
 
 
 @router.post("/mark-read")
 async def notification_mark_read(body: MarkReadRequest):
-    """Mark notifications as read by clearing the store."""
+    """Mark notifications as read or all read if no IDs are provided."""
     uid = normalize_user_id(body.userId)
-    count = len(_get_notifications(uid))
-    _notification_store[uid] = []
-    log.info("Marked %d notifications as read for user %s", count, uid)
-    return {"ok": True, "cleared": count, "userId": uid}
+    result = mark_notifications_read(uid, body.notification_ids, profile_dir=config.profile_dir)
+    log.info("Marked notifications read for user %s: %s", uid, result)
+    return {"ok": True, "userId": uid, **result}
