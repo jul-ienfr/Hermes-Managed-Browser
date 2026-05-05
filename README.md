@@ -11,6 +11,8 @@ server/                         Python Managed Browser backend
   camofox/core/session.py       engine-aware sessions and tabs
 plugins/hermes/managed-browser/
                                 Hermes managed_browser_* tools and profiles
+legacy/camofox-node/
+                                Original Node Camofox server and plugins, kept for compatibility
 ```
 
 Supported engine names in the Python backend:
@@ -40,17 +42,18 @@ curl -X POST http://127.0.0.1:9377/tabs \
   -d '{"userId":"cloak-smoke","engine":"cloakbrowser","url":"https://example.com/"}'
 ```
 
-## Legacy Camofox Node documentation
+## Legacy Camofox Node
 
-The sections below come from the original Node Camofox project and are kept as legacy reference while the Python Managed Browser backend becomes the main project.
-
----
+The original Node Camofox server has been moved to `legacy/camofox-node/`. It is kept for compatibility and historical reference while the Python Managed Browser backend becomes the main project.
 
 ```bash
-git clone https://github.com/jo-inc/camofox-browser && cd camofox-browser
-npm install && npm start
+cd legacy/camofox-node
+npm install
+npm start
 # → http://localhost:9377
 ```
+
+The sections below are the original Node Camofox documentation.
 
 ---
 

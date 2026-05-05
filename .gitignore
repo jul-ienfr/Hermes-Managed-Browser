@@ -51,3 +51,4 @@ venv/
 test-results/
 playwright-report/
 tests/tmp/cookies-profiles-*/
+legacy/camofox-node/tests/tmp/cookies-profiles-*/
