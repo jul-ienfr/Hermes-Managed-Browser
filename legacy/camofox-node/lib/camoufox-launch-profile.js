@@ -1,4 +1,7 @@
 import { generateFingerprint } from 'camoufox-js/dist/fingerprints.js';
+import fs from 'fs';
+import path from 'path';
+import os from 'os';
 
 function normalizedLocale(locale) {
   if (Array.isArray(locale)) return locale.filter(Boolean);
@@ -21,6 +24,58 @@ function exactScreenConstraint(screen) {
   const height = Number.parseInt(String(screen?.height || ''), 10);
   if (!Number.isFinite(width) || width <= 0 || !Number.isFinite(height) || height <= 0) return undefined;
   return { minWidth: width, maxWidth: width, minHeight: height, maxHeight: height };
+}
+
+const CAMOUFOX_CACHE = path.join(os.homedir(), '.cache', 'camoufox');
+
+/**
+ * Read active_version from ~/.cache/camoufox/config.json (Python multi-version cache).
+ * Returns null when the file doesn't exist or is unreadable.
+ */
+function readActiveVersionFromConfig() {
+  const configPath = path.join(CAMOUFOX_CACHE, 'config.json');
+  try {
+    if (fs.existsSync(configPath)) {
+      const raw = JSON.parse(fs.readFileSync(configPath, 'utf-8'));
+      if (raw && raw.active_version) return raw.active_version;
+    }
+  } catch {
+    // ignore parse errors
+  }
+  return null;
+}
+
+/**
+ * Resolve a browserVersion specifier to an absolute executable path.
+ *
+ * Specifier formats:
+ *   "browsers/official/146.0.1-alpha.25"  → ~/.cache/camoufox/browsers/official/146.0.1-alpha.25/camoufox-bin
+ *   "official/146.0.1-alpha.25"           → same (shorthand without "browsers/")
+ *   "coryking/142.0.1-fork.26"            → ~/.cache/camoufox/browsers/coryking/142.0.1-fork.26/camoufox-bin
+ *   "146.0.1-alpha.25"                    → ~/.cache/camoufox/browsers/official/146.0.1-alpha.25/camoufox-bin
+ *   "/absolute/path/to/camoufox-bin"      → used as-is
+ *
+ * Returns null if unresolvable.
+ */
+function resolveBrowserVersion(version) {
+  if (!version || typeof version !== 'string') return null;
+  // Absolute path
+  if (version.startsWith('/')) {
+    return fs.existsSync(version) ? version : null;
+  }
+  // Already in browsers/{repo}/{ver}/ format
+  let relPath;
+  if (version.startsWith('browsers/')) {
+    relPath = version;
+  } else if (version.startsWith('official/') || version.startsWith('coryking/')) {
+    relPath = `browsers/${version}`;
+  } else {
+    // Bare version string — assume official repo
+    relPath = `browsers/official/${version}`;
+  }
+  const candidate = path.join(CAMOUFOX_CACHE, relPath, 'camoufox-bin');
+  if (fs.existsSync(candidate)) return candidate;
+  return null;
 }
 
 function exactWindowTuple(windowLike) {
@@ -134,6 +189,16 @@ function buildCamoufoxLaunchOptionsInput(launchProfile = {}, options = {}) {
   if (options.virtualDisplay) out.virtual_display = options.virtualDisplay;
   if (options.proxy) out.proxy = options.proxy;
   if (options.geoip !== undefined) out.geoip = options.geoip;
+
+  // Browser version override — resolve executable_path from version string.
+  // Falls back to the Python CLI's active_version from config.json when no
+  // explicit version was given, so camoufox-js doesn't try to download/check
+  // its own cached binary (which would fail the version constraint check).
+  const browserVersion = options.browserVersion || launchProfile.browserVersion || readActiveVersionFromConfig();
+  if (browserVersion) {
+    const resolved = resolveBrowserVersion(browserVersion);
+    if (resolved) out.executable_path = resolved;
+  }
   return out;
 }
 
@@ -172,4 +237,7 @@ export {
   expectedFingerprintFromLaunchProfile,
   generateCanonicalFingerprint,
   resolveFingerprintGeneratorConfig,
+  resolveBrowserVersion,
+  readActiveVersionFromConfig,
+  CAMOUFOX_CACHE,
 };

@@ -70,6 +70,8 @@ import {
   buildCamoufoxLaunchOptionsInput,
   expectedFingerprintFromLaunchProfile,
   generateCanonicalFingerprint,
+  resolveBrowserVersion,
+  readActiveVersionFromConfig,
 } from './lib/camoufox-launch-profile.js';
 import {
   detectSensitivePolicyChange,
@@ -998,9 +1000,11 @@ async function launchBrowserInstance(userId, { profileDir } = {}) {
         geoip: !!launchProxy,
         virtualDisplay: vdDisplay,
       });
+      const personaHardwareConcurrency = launchProfile?.persona?.hardwareConcurrency;
       let options = await launchOptions({
         ...camoufoxInput,
         enable_cache: true,
+        ...(Number.isInteger(personaHardwareConcurrency) ? { config: { 'navigator.hardwareConcurrency': personaHardwareConcurrency } } : {}),
       });
       options.proxy = normalizePlaywrightProxy(options.proxy);
       options = withManagedProfileLaunchArgs(options, launchProfile);
@@ -1272,6 +1276,18 @@ async function getSession(userId, { profileDir } = {}) {
         }).catch((err) => log('warn', 'notification capture install failed', { userId: key, error: err.message }));
       }
       
+      // Inject deviceMemory via JS (Firefox doesn't support it natively, Camoufox can't spoof it)
+      const personaDeviceMemory = launchPersona?.persona?.deviceMemory;
+      if (Number.isInteger(personaDeviceMemory)) {
+        context.addInitScript((value) => {
+          Object.defineProperty(navigator, 'deviceMemory', {
+            get: () => value,
+            configurable: true,
+            enumerable: true,
+          });
+        }, personaDeviceMemory).catch((err) => log('warn', 'deviceMemory initScript failed', { userId: key, error: err.message }));
+      }
+
       const created = {
         context,
         tabGroups: new Map(),
@@ -5752,6 +5768,54 @@ const pluginCtx = {
   VirtualDisplay,
 };
 const loadedPlugins = await loadPlugins(app, pluginCtx);
+
+// Ensure ~/.cache/camoufox/camoufox-bin exists for camoufox-js pkgman.
+// The Python camoufox CLI stores versions in subdirectories (browsers/official/{ver}/)
+// which confuses camoufox-js's launchPath() that expects flat version.json + camoufox-bin.
+function ensureCamoufoxRootCache() {
+  const homeDir = os.homedir();
+  const cacheDir = path.join(homeDir, '.cache', 'camoufox');
+  const binPath = path.join(cacheDir, 'camoufox-bin');
+  const versionJsonPath = path.join(cacheDir, 'version.json');
+  if (fs.existsSync(binPath) && fs.existsSync(versionJsonPath)) {
+    return; // Everything looks good
+  }
+  const activeVersion = readActiveVersionFromConfig();
+  if (!activeVersion) {
+    log('warn', 'camoufox root cache empty and no active_version in config.json — camoufox-js may download a fresh binary');
+    return;
+  }
+  const resolved = resolveBrowserVersion(activeVersion);
+  if (!resolved) {
+    log('warn', 'camoufox root cache repair: active_version not found on disk', { activeVersion });
+    return;
+  }
+  try {
+    // Symlink camoufox-bin
+    if (!fs.existsSync(binPath)) {
+      fs.symlinkSync(resolved, binPath);
+    }
+    // Create version.json for camoufox-js from the version subdirectory
+    if (!fs.existsSync(versionJsonPath)) {
+      const subDir = path.dirname(resolved).replace(/^\/+/, '');
+      const subVersionJson = path.join(cacheDir, activeVersion, 'version.json');
+      if (fs.existsSync(subVersionJson)) {
+        const v = JSON.parse(fs.readFileSync(subVersionJson, 'utf-8'));
+        // camoufox-js expects {release, version} where release=version.build
+        // Python stores {version, build} in subdirectory version.json
+        const flatVersion = {
+          release: `${v.version}.${v.build}`,
+          version: v.version,
+        };
+        fs.writeFileSync(versionJsonPath, JSON.stringify(flatVersion, null, 2) + '\n');
+      }
+    }
+    log('info', 'camoufox root cache repaired for camoufox-js compat', { activeVersion });
+  } catch (err) {
+    log('warn', 'camoufox root cache repair failed', { error: err.message });
+  }
+}
+ensureCamoufoxRootCache();
 
 const server = app.listen(PORT, async () => {
   startMemoryReporter();

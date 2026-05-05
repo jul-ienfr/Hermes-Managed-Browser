@@ -52,6 +52,23 @@ const MANAGED_PROFILES = new Map([
       securityPolicy: { site: 'vinted', browserOnly: true, requireConfirmationForBindingActions: true },
     },
   ],
+    [
+    'facebook-ju',
+    {
+      profile: 'facebook-ju',
+      siteKey: 'facebook-marketplace',
+      userId: 'facebook-ju',
+      sessionKey: 'managed:facebook-ju',
+      defaultStartUrl: 'https://www.facebook.com/marketplace/',
+      profileDir: '/home/jul/.vnc-browser-profiles/facebook-ju',
+      browserPersonaKey: 'managed:facebook-ju:browser',
+      humanPersonaKey: 'managed:facebook-ju:human',
+      defaultHumanProfile: 'fast',
+      displayPolicy: { mode: 'managed-autonomous', allowServerOwnedVisibleLaunch: true },
+      lifecyclePolicy: { warmup: { enabled: false, reason: 'manual-profile-only' }, rotation: { mode: 'manual', maxSessionAgeMinutes: 240 } },
+      securityPolicy: { site: 'facebook-marketplace', browserOnly: true, requireConfirmationForBindingActions: true },
+    },
+  ],
   [
     'emploi-officiel',
     {
