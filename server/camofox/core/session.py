@@ -34,6 +34,7 @@ from camofox.core.utils import (
     normalize_user_id,
     safe_page_close,
 )
+from camofox.domain.profile import load_persisted_storage_state, persist_storage_state
 
 log = logging.getLogger("camofox.session")
 
@@ -449,6 +450,12 @@ async def _create_session(
             context_options["proxy"] = proxy_dict
 
     # --- 4. Create the BrowserContext ---
+    effective_profile_dir = profile_dir or config.profile_dir
+    storage_state_path = load_persisted_storage_state(effective_profile_dir, uid)
+    if storage_state_path:
+        context_options["storage_state"] = storage_state_path
+        log.debug("Loading persisted storage state for %s from %s", uid, storage_state_path)
+
     plugin_events.emit("session:creating", user_id=uid)
     context = await browser.new_context(**context_options)
 
@@ -488,7 +495,7 @@ async def _create_session(
     session_state = SessionState(
         context=context,
         engine=normalized_engine,
-        profile_dir=profile_dir,
+        profile_dir=effective_profile_dir,
         launch_persona=launch_persona,
         display=display,
         proxy_session_id=proxy_session_id,
@@ -613,6 +620,27 @@ async def close_session(
                 if lock is not None:
                     lock.drain()
 
+    # --- Save storage state before page/context teardown ---
+    # Playwright can refuse BrowserContext.storage_state() once pages or the
+    # underlying browser have started closing. Persist first, then destroy tabs.
+    try:
+        if session.profile_dir is not None and hasattr(session.context, "storage_state"):
+            result = await asyncio.wait_for(
+                persist_storage_state(session.profile_dir, uid, session.context), timeout=5.0
+            )
+            if result.get("error"):
+                log.warning("Failed to persist storage state for %s: %s", uid, result["error"])
+            else:
+                log.debug("Storage state persisted for %s to %s", uid, result.get("path"))
+    except Exception as exc:
+        log.warning("Failed to save storage state for %s: %s", uid, exc)
+
+    # --- Clear downloads before tab registry teardown ---
+    if clear_downloads:
+        for group in session.tab_groups.values():
+            for ts in group.values():
+                ts.downloads.clear()
+
     # --- Destroy tabs ---
     for group_key, group in list(session.tab_groups.items()):
         for tab_id, ts in list(group.items()):
@@ -621,28 +649,9 @@ async def close_session(
             except Exception:
                 pass
             record_tab_destroyed(reason=reason).inc()
-            del group[tab_id]
+            group.pop(tab_id, None)
         if not group:
-            del session.tab_groups[group_key]
-
-    # --- Clear downloads ---
-    if clear_downloads:
-        for group in session.tab_groups.values():
-            for ts in group.values():
-                ts.downloads.clear()
-
-    # --- Save storage state ---
-    try:
-        if hasattr(session.context, "storage_state"):
-            storage = await asyncio.wait_for(
-                session.context.storage_state(), timeout=5.0
-            )
-            # Storage state is saved automatically by Playwright to the
-            # profile directory; we just retrieve and log.
-            if storage:
-                log.debug("Storage state captured for %s", uid)
-    except Exception as exc:
-        log.warning("Failed to save storage state for %s: %s", uid, exc)
+            session.tab_groups.pop(group_key, None)
 
     # --- Close the context ---
     ctx = session.context

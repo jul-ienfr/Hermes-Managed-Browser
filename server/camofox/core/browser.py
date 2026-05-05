@@ -312,11 +312,12 @@ async def launch_browser_instance(
                 ac = AsyncCamoufox(**launch_opts)
                 browser_obj = await ac.__aenter__()
             elif normalized_engine == CLOAKBROWSER:
-                pw, browser_obj = await _launch_cloak_browser(
+                browser_obj = await _launch_cloak_browser(
                     proxy=proxy_for_launch,
                     display=display_str,
+                    persona=persona,
                 )
-                entry._playwright = pw
+                # cloakbrowser patches browser.close() internally — no _playwright to track
             else:
                 raise RuntimeError(f"Engine {normalized_engine} is not implemented in the Python server")
 
@@ -608,48 +609,75 @@ def _build_camoufox_launch_options(
     return launch_options(**opts)
 
 
-async def _launch_cloak_browser(proxy: dict | None, display: str | None) -> tuple[Any, Any]:
+async def _launch_cloak_browser(
+    proxy: dict | None,
+    display: str | None,
+    persona: dict | None = None,
+) -> Any:
+    """Launch CloakBrowser via the ``cloakbrowser`` package.
+
+    ``cloakbrowser.launch_async`` manages its own Playwright session and
+    patches ``browser.close()`` to also stop the Playwright instance, so
+    callers do NOT need to track a separate ``_playwright`` handle.
+    """
     if not config.cloakbrowser_enabled:
         raise RuntimeError("CloakBrowser engine is disabled. Set CLOAK_BROWSER_ENABLED=1.")
 
-    executable_path = config.cloakbrowser_executable_path or os.environ.get("CLOAK_BROWSER_EXECUTABLE_PATH", "")
-    if not executable_path:
-        raise RuntimeError("CLOAK_BROWSER_EXECUTABLE_PATH is required for CloakBrowser engine")
+    from cloakbrowser import launch_async, ensure_binary
 
-    resolved_executable = Path(executable_path).expanduser()
-    if not resolved_executable.is_file():
-        raise RuntimeError(f"CloakBrowser executable not found: {resolved_executable}")
+    # Ensure the binary is downloaded before launching
+    ensure_binary()
 
-    proxy_dict: dict[str, str] | None = None
-    if proxy:
-        proxy_dict = {}
-        if proxy.get("host"):
-            proxy_dict["server"] = f"{proxy['host']}:{proxy.get('port', 0)}"
+    # Map proxy to the format CloakBrowser / Playwright expects
+    proxy_arg: str | dict | None = None
+    if proxy and proxy.get("host"):
+        server = f"{proxy['host']}:{proxy.get('port', 0)}"
         if proxy.get("username"):
-            proxy_dict["username"] = proxy["username"]
-        if proxy.get("password"):
-            proxy_dict["password"] = proxy["password"]
-        if not proxy_dict:
-            proxy_dict = None
+            proxy_arg = {
+                "server": server,
+                "username": proxy["username"],
+                "password": proxy.get("password", ""),
+            }
+        else:
+            proxy_arg = server
 
-    from playwright.async_api import async_playwright
+    # Verify the display is actually available before going headed
+    headless = True
+    if display:
+        import subprocess as _subprocess
 
-    pw = await async_playwright().start()
-    try:
-        browser = await pw.chromium.launch(
-            executable_path=str(resolved_executable),
-            headless=not bool(display),
-            proxy=proxy_dict,
-            args=[
-                "--no-first-run",
-                "--no-default-browser-check",
-                "--disable-dev-shm-usage",
-            ],
-        )
-        return pw, browser
-    except Exception:
-        await pw.stop()
-        raise
+        try:
+            _result = _subprocess.run(
+                ["xdpyinfo", "-display", display],
+                capture_output=True, timeout=3,
+            )
+            headless = _result.returncode != 0
+        except (FileNotFoundError, _subprocess.TimeoutExpired, OSError):
+            headless = True
+
+    kwargs: dict[str, Any] = {
+        "headless": headless,
+        "proxy": proxy_arg,
+        "humanize": True,
+        "args": [
+            "--no-first-run",
+            "--no-default-browser-check",
+            "--disable-dev-shm-usage",
+        ],
+    }
+
+    # Pass persona / env values through to CloakBrowser
+    tz = os.environ.get("CAMOFOX_TIMEZONE")
+    if tz:
+        kwargs["timezone"] = tz
+    locale_val = os.environ.get("CAMOFOX_LOCALE")
+    if locale_val:
+        kwargs["locale"] = locale_val
+    geoip = os.environ.get("CAMOFOX_GEOIP", "").lower()
+    if geoip in ("1", "true"):
+        kwargs["geoip"] = True
+
+    return await launch_async(**kwargs)
 
 
 # ---------------------------------------------------------------------------

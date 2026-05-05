@@ -28,10 +28,12 @@ from camofox.core.session import (
 )
 from camofox.core.utils import normalize_user_id, validate_url, safe_page_close
 from camofox.domain.actions import human_click, human_type, human_scroll, human_press
+from camofox.domain.memory_store import load_flow, record_flow
 from camofox.domain.snapshot import build_snapshot, window_snapshot, compact_snapshot
 
 log = logging.getLogger("camofox.api.tabs")
 router = APIRouter()
+AUTO_HISTORY_FLOW_ID = "browser-actions"
 
 
 # ---------------------------------------------------------------------------
@@ -133,6 +135,82 @@ def _resolve_tab(user_id: str, tab_id: str | None = None, engine: str | None = N
                 "group": group_key,
             }
     raise HTTPException(404, {"error": "No tabs found for user"})
+
+
+def _target_summary_from_ref(tab_state: Any, ref: str | None) -> dict[str, Any] | None:
+    """Return a compact, replay-oriented target summary for a recorded ref."""
+    if not ref:
+        return None
+    ref_info = tab_state.refs.get(ref) if getattr(tab_state, "refs", None) else None
+    if not isinstance(ref_info, dict):
+        return None
+    summary: dict[str, Any] = {}
+    for key in ("role", "name", "text", "selector", "value"):
+        value = ref_info.get(key)
+        if value not in (None, ""):
+            summary[key] = value
+    attrs = ref_info.get("attributes")
+    if isinstance(attrs, dict):
+        stable_attrs = {
+            str(k): v
+            for k, v in attrs.items()
+            if k in {"id", "name", "placeholder", "aria-label", "href", "data-testid", "data-test", "data-cy", "type"}
+            and v not in (None, "")
+        }
+        if stable_attrs:
+            summary["attributes"] = stable_attrs
+    return summary or None
+
+
+def _looks_sensitive_target(target_summary: dict[str, Any] | None) -> bool:
+    if not target_summary:
+        return False
+    haystack: list[str] = []
+    for key in ("name", "text", "selector", "value"):
+        value = target_summary.get(key)
+        if isinstance(value, str):
+            haystack.append(value)
+    attrs = target_summary.get("attributes")
+    if isinstance(attrs, dict):
+        haystack.extend(str(v) for v in attrs.values() if v is not None)
+    lowered = " ".join(haystack).lower()
+    return any(marker in lowered for marker in ("password", "passwd", "pwd", "secret", "token", "api-key", "api_key", "authorization"))
+
+
+def _record_successful_tab_action(
+    session: Any,
+    tab_state: Any,
+    user_id: str,
+    tab_id: str,
+    action: dict[str, Any],
+) -> None:
+    """Persist successful browser actions without letting recording break the route."""
+    try:
+        clean_action = {k: v for k, v in action.items() if v is not None}
+        clean_action.setdefault("kind", clean_action.get("action"))
+        clean_action["tab_id"] = tab_id
+        if clean_action.get("ref") and not clean_action.get("target_summary"):
+            clean_action["target_summary"] = _target_summary_from_ref(tab_state, clean_action.get("ref"))
+        if not clean_action.get("target_summary") and clean_action.get("selector"):
+            clean_action["target_summary"] = {"selector": clean_action.get("selector")}
+        if clean_action.get("action") in {"type", "fill"} and _looks_sensitive_target(clean_action.get("target_summary")):
+            clean_action["text"] = "[REDACTED]"
+            clean_action["text_redacted"] = True
+            clean_action.pop("chars", None)
+
+        tab_state.agent_history_steps.append(clean_action)
+        existing = load_flow(user_id, AUTO_HISTORY_FLOW_ID, profile_dir=session.profile_dir)
+        flow = list(existing.get("flow", [])) if isinstance(existing, dict) and isinstance(existing.get("flow"), list) else []
+        flow.append(clean_action)
+        record_flow(
+            user_id,
+            flow,
+            flow_id=AUTO_HISTORY_FLOW_ID,
+            metadata={"source": "auto-record", "engine": session.engine, "tabId": tab_id},
+            profile_dir=session.profile_dir,
+        )
+    except Exception as err:  # pragma: no cover - defensive best-effort hook
+        log.warning("agent history auto-record failed", extra={"error": str(err), "action": action.get("action")})
 
 
 # ---------------------------------------------------------------------------
@@ -244,6 +322,13 @@ async def navigate_tab(tabId: str, body: NavigateRequest):
             )
             tab_state.visited_urls.add(body.url)
             tab_state.last_requested_url = body.url
+            _record_successful_tab_action(
+                session,
+                tab_state,
+                uid,
+                resolved_tab_id,
+                {"action": "navigate", "url": body.url, "result": {"url": body.url}},
+            )
             return {"ok": True, "url": body.url}
 
         return await with_tab_lock(resolved_tab_id, _navigate)
@@ -279,10 +364,24 @@ async def click_tab(tabId: str, body: ClickRequest):
                     if element:
                         await human_click(tab_state.page, selector)
                         tab_state.tool_calls += 1
+                        _record_successful_tab_action(
+                            session,
+                            tab_state,
+                            uid,
+                            resolved_tab_id,
+                            {"action": "click", "ref": body.ref, "selector": selector},
+                        )
                         return {"ok": True, "ref": body.ref}
             # Fallback: try using the ref as a selector directly
             await human_click(tab_state.page, body.ref)
             tab_state.tool_calls += 1
+            _record_successful_tab_action(
+                session,
+                tab_state,
+                uid,
+                resolved_tab_id,
+                {"action": "click", "ref": body.ref, "selector": body.ref},
+            )
             return {"ok": True, "ref": body.ref}
 
         return await with_tab_lock(resolved_tab_id, _click)
@@ -311,10 +410,24 @@ async def type_tab(tabId: str, body: TypeRequest):
                 if selector:
                     await human_type(tab_state.page, selector, body.text)
                     tab_state.tool_calls += 1
+                    _record_successful_tab_action(
+                        session,
+                        tab_state,
+                        uid,
+                        resolved_tab_id,
+                        {"action": "type", "ref": body.ref, "selector": selector, "text": body.text, "chars": len(body.text)},
+                    )
                     return {"ok": True, "ref": body.ref, "chars": len(body.text)}
             # Fallback: try using the ref as a selector directly
             await human_type(tab_state.page, body.ref, body.text)
             tab_state.tool_calls += 1
+            _record_successful_tab_action(
+                session,
+                tab_state,
+                uid,
+                resolved_tab_id,
+                {"action": "type", "ref": body.ref, "selector": body.ref, "text": body.text, "chars": len(body.text)},
+            )
             return {"ok": True, "ref": body.ref, "chars": len(body.text)}
 
         return await with_tab_lock(resolved_tab_id, _type)
@@ -339,6 +452,13 @@ async def press_tab(tabId: str, body: PressRequest):
         async def _press():
             await human_press(tab_state.page, body.key)
             tab_state.tool_calls += 1
+            _record_successful_tab_action(
+                session,
+                tab_state,
+                uid,
+                resolved_tab_id,
+                {"action": "press", "key": body.key},
+            )
             return {"ok": True, "key": body.key}
 
         return await with_tab_lock(resolved_tab_id, _press)
@@ -363,6 +483,13 @@ async def scroll_tab(tabId: str, body: ScrollRequest):
         async def _scroll():
             await human_scroll(tab_state.page, direction=body.direction)
             tab_state.tool_calls += 1
+            _record_successful_tab_action(
+                session,
+                tab_state,
+                uid,
+                resolved_tab_id,
+                {"action": "scroll", "direction": body.direction},
+            )
             return {"ok": True, "direction": body.direction}
 
         return await with_tab_lock(resolved_tab_id, _scroll)

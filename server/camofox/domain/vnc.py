@@ -12,6 +12,7 @@ import logging
 import os
 import shutil
 import subprocess
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
 
@@ -21,7 +22,8 @@ log = logging.getLogger("camofox.vnc")
 # Constants
 # ---------------------------------------------------------------------------
 
-DISPLAY_REGISTRY_PATH = Path.home() / ".camofox" / "vnc-display-registry.json"
+DISPLAY_REGISTRY_PATH = Path(os.environ.get("CAMOFOX_VNC_DISPLAY_REGISTRY", "/tmp/camofox-vnc-displays.json"))
+DISPLAY_SELECTION_PATH = Path(os.environ.get("CAMOFOX_VNC_DISPLAY_SELECTION", "/tmp/camofox-vnc-selected-display.json"))
 
 # ---------------------------------------------------------------------------
 # Config resolution
@@ -82,7 +84,7 @@ def resolve_vnc_config(plugin_config: dict | None = None) -> dict:
     env_bind = os.environ.get("VNC_BIND")
     env_human_only = os.environ.get("VNC_HUMAN_ONLY")
     env_managed_only = os.environ.get("VNC_MANAGED_REGISTRY_ONLY")
-    env_display_selection = os.environ.get("VNC_DISPLAY_SELECTION")
+    env_display_selection = os.environ.get("CAMOFOX_VNC_DISPLAY_SELECTION") or os.environ.get("VNC_DISPLAY_SELECTION")
 
     # --- Resolve enabled ---
     if env_enabled is not None:
@@ -134,7 +136,7 @@ def resolve_vnc_config(plugin_config: dict | None = None) -> dict:
         managed_registry_only = bool(pc.get("managed_registry_only", False))
 
     # --- Resolve display_selection ---
-    display_selection: str = env_display_selection or str(pc.get("display_selection", ""))
+    display_selection: str = env_display_selection or str(pc.get("display_selection", DISPLAY_SELECTION_PATH))
 
     return {
         "enabled": enabled,
@@ -239,8 +241,12 @@ def record_vnc_display(
     """
     registry = read_display_registry()
     entry: dict[str, Any] = {
+        "userId": str(user_id),
         "display": display,
+        "pid": os.getpid(),
         "resolution": resolution,
+        "profileWindowSize": profile_window_size,
+        "updatedAt": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
     }
     if profile_window_size is not None:
         entry["profile_window_size"] = profile_window_size
@@ -290,8 +296,8 @@ def read_selected_vnc_user_id(
     display_selection_scheme : str or None
         Path to the scheme file (a text file with one line — the user ID).
         If ``None``, reads from the environment variable
-        ``VNC_DISPLAY_SELECTION`` or the default location
-        ``~/.camofox/vnc-display-selection.txt``.
+        ``CAMOFOX_VNC_DISPLAY_SELECTION`` / ``VNC_DISPLAY_SELECTION`` or the
+        default runtime selection JSON used by the Node switcher.
 
     Returns
     -------
@@ -303,9 +309,9 @@ def read_selected_vnc_user_id(
     if display_selection_scheme:
         path_str = display_selection_scheme
     else:
-        path_str = os.environ.get(
+        path_str = os.environ.get("CAMOFOX_VNC_DISPLAY_SELECTION") or os.environ.get(
             "VNC_DISPLAY_SELECTION",
-            str(Path.home() / ".camofox" / "vnc-display-selection.txt"),
+            str(DISPLAY_SELECTION_PATH),
         )
 
     scheme_path = Path(path_str)
@@ -314,7 +320,15 @@ def read_selected_vnc_user_id(
 
     try:
         content = scheme_path.read_text().strip()
-        return content if content else None
+        if not content:
+            return None
+        try:
+            parsed = json.loads(content)
+            if isinstance(parsed, dict) and parsed.get("userId"):
+                return str(parsed["userId"])
+        except json.JSONDecodeError:
+            pass
+        return content
     except OSError as exc:
         log.warning("Failed to read VNC display selection file: %s", exc)
         return None
